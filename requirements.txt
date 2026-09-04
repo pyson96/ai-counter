@@ -1,0 +1,27 @@
+# Install PyTorch with CUDA first (RTX 3080 / Windows / Python 3.10-3.11):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+torch>=2.1
+torchvision>=0.16
+
+ultralytics>=8.3          # YOLO11 detector + ByteTrack / BoT-SORT
+opencv-python>=4.8
+numpy>=1.24
+PyYAML>=6.0
+scipy>=1.10
+
+# MiVOLO v2 (age + gender, face AND body).
+# timm is pinned because MiVOLO subclasses timm's VOLO and depends on that exact
+# constructor signature; models.py shims newer timm but the pin is the safe path.
+transformers==4.51.0
+accelerate>=1.0
+timm==0.8.13.dev0
+huggingface_hub>=0.24
+# The `mivolo` package itself cannot go here: its setup.py imports pkg_resources,
+# which modern pip build isolation does not provide. Install it separately with
+#   pip install wheel
+#   pip install --no-deps --no-build-isolation git+https://github.com/WildChlamydia/MiVOLO.git
+# (see README). --no-deps is required so it does not downgrade ultralytics to 8.1.
+
+# weight downloads
+gdown>=5.0
+lap>=0.5                  # ByteTrack assignment solver

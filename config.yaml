@@ -1,0 +1,120 @@
+# ---------------------------------------------------------------------------
+# Local person analysis pipeline - configuration
+# Everything runs locally on the GPU. No cloud APIs are used anywhere.
+# ---------------------------------------------------------------------------
+
+video:
+  input: test.mp4
+  output: output/result.mp4
+  output_dir: output
+  max_frames: 0          # 0 = whole video (useful for quick debugging runs)
+  start_frame: 0
+
+device:
+  cuda: true
+  fp16: true             # autocast fp16 for ReID / demographics
+
+# ---------------------------------------------------------------------------
+# Person detection (YOLO11-X, person class only)
+# ---------------------------------------------------------------------------
+detection:
+  model: weights/yolo11x.pt
+  confidence: 0.40
+  iou: 0.70
+  imgsz: 960
+  max_det: 100
+  interval: 1            # run detector every N frames (1 = every frame)
+  min_box_height: 64     # ignore very small person boxes entirely
+
+# ---------------------------------------------------------------------------
+# Local (short-term) tracking.
+# NOTE: these IDs are temporary. Persistent identity comes from ReID only -
+# the track buffer is deliberately kept short so long-term identity cannot be
+# faked by the tracker.
+# ---------------------------------------------------------------------------
+tracking:
+  tracker: bytetrack     # bytetrack | botsort
+  config_path: ""        # optional path to a custom ultralytics tracker yaml
+  max_age_frames: 30     # frames a local track may be missing before we drop it (1s @30fps)
+  # ByteTrack needs to see the LOW-confidence boxes too - that second association
+  # pass is the whole point of the algorithm - so the detector is run at a low
+  # threshold and detection.confidence becomes the tracker's high threshold.
+  detect_low_conf: 0.10
+  new_track_conf: 0.45   # confidence required to start a brand new local track
+  match_thresh: 0.80
+
+# ---------------------------------------------------------------------------
+# Long-term person Re-Identification (SOLIDER)
+# ---------------------------------------------------------------------------
+reid:
+  model: solider_swin_base         # solider_swin_tiny | solider_swin_small | solider_swin_base
+  weights: weights/solider_swin_base_msmt17.pth
+  semantic_weight: 0.2             # SOLIDER semantic control (0.2 = ReID setting)
+  neck_feat: after                 # before | after  (BNNeck feature used at test time)
+  input_size: [384, 128]           # H, W
+  pixel_mean: [0.5, 0.5, 0.5]
+  pixel_std: [0.5, 0.5, 0.5]
+  batch_size: 16
+  flip_augment: true               # average feature of image + horizontal flip
+
+  extraction_interval: 5           # extract a feature every N frames per track
+  min_quality: 0.45                # crop quality gate for using an embedding at all
+  gallery_min_quality: 0.55        # stricter gate before storing into the gallery
+  gallery_min_interval: 8          # min frames between two stored embeddings
+  max_embeddings_per_person: 20
+  min_embeddings_to_assign: 2      # embeddings needed before a track claims an identity
+  reassess_embeddings: 8           # re-check that identity once this many exist (see README)
+
+  # matching
+  similarity_threshold: 0.82       # required appearance cosine similarity
+  second_best_margin: 0.05         # best must beat 2nd best by this much
+  match_topk: 3                    # appearance score = mean of top-K gallery similarities
+  score_weights:                   # used to RANK candidates (appearance still gates)
+    reid: 0.85
+    temporal: 0.10
+    spatial: 0.05
+  temporal_tau_seconds: 45.0       # temporal score = exp(-gap / tau)
+  spatial_sigma: 0.35              # spatial score = exp(-(dist/diag) / sigma)
+  spatial_max_gap_seconds: 3.0     # beyond this gap position carries no information
+  min_reentry_gap_seconds: 0.5     # shorter gaps are ID-recovery, not a real re-entry
+
+  keep_lost_until_video_end: true
+
+# ---------------------------------------------------------------------------
+# Age + gender (MiVOLO v2, face + body dual input)
+# ---------------------------------------------------------------------------
+demographics:
+  enabled: true
+  model: mivolo_v2
+  hf_repo: iitolstykh/mivolo_v2
+  face_detector: weights/yolov8x_person_face.pt
+  face_confidence: 0.40
+  interval: 15               # frames between samples for one person
+  relaxed_interval: 60       # slower cadence once enough samples exist
+  minimum_samples: 5         # samples needed before the estimate is called confident
+  enough_samples: 25         # switch to relaxed_interval after this many
+  max_samples: 80
+  min_quality: 0.45
+  batch_size: 8
+  gender_min_confidence: 0.60   # below this the aggregated gender becomes "unknown"
+  age_trim: 0.10                # winsorise the lowest/highest 10% before averaging
+
+# ---------------------------------------------------------------------------
+# Result video
+# ---------------------------------------------------------------------------
+visualization:
+  show_person_name: true
+  show_age: true
+  show_gender: true
+  show_reid_match: true
+  show_local_track_id: false     # debug only - never the main identity
+  reid_match_seconds: 1.5        # how long the RE-ID MATCH banner stays visible
+  show_hud: true                 # frame/time/active-person counter
+  font_scale: 0.75
+  thickness: 2
+
+debug:
+  save_reid_crops: true
+  save_frame_results: false
+  reid_debug_dir: output/reid_debug
+  verbose: true
