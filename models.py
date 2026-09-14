@@ -232,6 +232,22 @@ _REID_ARCH = {
     "solider_swin_base": solider_swin.swin_base_patch4_window7_224,
 }
 
+# Feature width of each SOLIDER variant, used to check a checkpoint actually
+# belongs to the architecture named in the config before trying to load it.
+_REID_DIM = {"solider_swin_tiny": 768, "solider_swin_small": 768, "solider_swin_base": 1024}
+_REID_DEPTH = {"solider_swin_tiny": 6, "solider_swin_small": 18, "solider_swin_base": 18}
+
+
+def _identify_checkpoint(sd):
+    """Work out which SOLIDER variant a state dict came from."""
+    dim = sd["bottleneck.weight"].shape[0] if "bottleneck.weight" in sd else None
+    depth = 1 + max((int(k.split(".")[4]) for k in sd if k.startswith("base.stages.2.blocks.")),
+                    default=-1)
+    for name in _REID_ARCH:
+        if _REID_DIM[name] == dim and _REID_DEPTH[name] == depth:
+            return name
+    return None
+
 
 class ReIDExtractor:
     """SOLIDER appearance embedding extractor.
@@ -244,11 +260,16 @@ class ReIDExtractor:
         name = rc["model"]
         if name not in _REID_ARCH:
             raise ValueError(f"unknown reid model {name!r}, expected one of {sorted(_REID_ARCH)}")
-        weights = rc["weights"]
+        # `weights: auto` (or blank) derives the path from the model name, so
+        # switching backbone is a ONE line config change and the two can never
+        # drift apart.
+        weights = str(rc.get("weights") or "auto").strip()
+        if weights.lower() in ("auto", ""):
+            weights = os.path.join("weights", f"{name}_msmt17.pth")
         if not os.path.exists(weights):
             raise FileNotFoundError(
                 f"ReID weights not found: {weights}\n"
-                "Run  python main.py --download-weights  (see README)."
+                f"Run  python main.py --download-weights --reid-model {name}  (see README)."
             )
 
         self.device = device
@@ -262,6 +283,13 @@ class ReIDExtractor:
         self.amp = bool(cfg["device"].get("fp16", True)) and device.type == "cuda"
 
         sd = torch.load(weights, map_location="cpu", weights_only=True)
+        actual = _identify_checkpoint(sd)
+        if actual is not None and actual != name:
+            raise ValueError(
+                f"reid.model is {name!r} but {weights} is a {actual!r} checkpoint.\n"
+                f"Set  reid.weights: auto  in config.yaml (recommended), or point it at "
+                f"weights/{name}_msmt17.pth."
+            )
         self.backbone = _REID_ARCH[name](
             img_size=(self.h, self.w), semantic_weight=float(rc.get("semantic_weight", 0.2))
         )
@@ -372,3 +400,57 @@ class DemographicsEstimator:
                         }
                     )
         return results
+
+
+class FaceEmbedder:
+    """FaceNet (InceptionResnetV1 / VGGFace2) embedding of a face crop.
+
+    Used ONLY to link the same person across re-entries WITHIN one video, as a
+    secondary signal behind the body appearance. Nothing is compared against any
+    external face database, no identity is looked up, and the embeddings live in
+    memory for the duration of the run and are never written to the outputs.
+
+    On surveillance footage faces are small (median ~46 px here) so this is a
+    weak signal on its own - measured 0.20 recall vs 0.72 for the body at the
+    same false-merge rate. It earns its place only in combination.
+    """
+
+    SIZE = 160
+
+    def __init__(self, cfg, device, stats):
+        from facenet_pytorch import InceptionResnetV1
+
+        fc = cfg["reid"].get("face_fusion", {})
+        self.device = device
+        self.stats = stats
+        self.min_pixels = int(fc.get("min_face_pixels", 24))
+        self.batch_size = int(fc.get("batch_size", 32))
+        self.amp = bool(cfg["device"].get("fp16", True)) and device.type == "cuda"
+        self.model = InceptionResnetV1(pretrained="vggface2")
+        self.model.to(device)
+        self.model.eval()
+        self.dim = 512
+        print("[Face] facenet-pytorch InceptionResnetV1 (vggface2) loaded "
+              "- within-video linking only")
+
+    def usable(self, crop):
+        return crop is not None and min(crop.shape[:2]) >= self.min_pixels
+
+    @torch.inference_mode()
+    def extract(self, crops):
+        """crops: list of BGR face images -> float32 [N, 512], L2-normalised."""
+        if not crops:
+            return np.zeros((0, self.dim), np.float32)
+        out = []
+        with self.stats.track("face_embed", items=len(crops)):
+            for i in range(0, len(crops), self.batch_size):
+                batch = np.stack([
+                    cv2.cvtColor(cv2.resize(c, (self.SIZE, self.SIZE)), cv2.COLOR_BGR2RGB)
+                    for c in crops[i: i + self.batch_size]
+                ]).astype(np.float32)
+                tensor = torch.from_numpy((batch - 127.5) / 128.0).permute(0, 3, 1, 2)
+                tensor = tensor.to(self.device, non_blocking=True)
+                with torch.autocast("cuda", dtype=torch.float16, enabled=self.amp):
+                    feat = self.model(tensor)
+                out.append(torch.nn.functional.normalize(feat.float(), dim=1).cpu().numpy())
+        return np.concatenate(out, 0).astype(np.float32)

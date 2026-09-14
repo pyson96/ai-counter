@@ -180,7 +180,14 @@ class PersonState:
         # appearance bank: several embeddings per person (pose / lighting / scale)
         self.embeddings = np.zeros((0, 0), np.float32)
         self.emb_quality = []
+        self.emb_frame = []          # which frame each stored embedding came from
         self.last_store_frame = -10 ** 9
+
+        # Secondary face bank. Faces are tiny in surveillance footage, so this
+        # only ever refines the body decision - it never decides on its own.
+        self.face_embeddings = np.zeros((0, 0), np.float32)
+        self.face_quality = []
+        self.last_face_frame = -10 ** 9
 
         self.age_samples = []       # dicts: age, weight, has_face, time
         self.gender_samples = []    # dicts: gender, conf, weight, time
@@ -223,21 +230,23 @@ class PersonState:
         if crop is not None and quality > self.best_crop_quality:
             self.best_crop = crop.copy()
             self.best_crop_quality = quality
-        if not self.insert_embedding(emb, quality):
+        if not self.insert_embedding(emb, quality, frame_idx):
             return False
         self.last_store_frame = frame_idx
         return True
 
-    def insert_embedding(self, emb, quality):
+    def insert_embedding(self, emb, quality, frame_idx=-1):
         """Ungated insert into the appearance bank (used when merging people)."""
         rc = self.cfg["reid"]
         cap = int(rc["max_embeddings_per_person"])
         if self.embeddings.shape[0] == 0:
             self.embeddings = emb[None, :].astype(np.float32)
             self.emb_quality = [quality]
+            self.emb_frame = [frame_idx]
         elif self.embeddings.shape[0] < cap:
             self.embeddings = np.vstack([self.embeddings, emb[None, :]])
             self.emb_quality.append(quality)
+            self.emb_frame.append(frame_idx)
         else:
             # Bank is full: drop whichever sample is worst once redundancy is
             # taken into account, so the bank keeps DIFFERENT views of the person.
@@ -251,7 +260,35 @@ class PersonState:
                 return False
             self.embeddings[worst] = emb
             self.emb_quality[worst] = quality
+            self.emb_frame[worst] = frame_idx
         return True
+
+    def store_face(self, emb, quality, frame_idx):
+        rc = self.cfg["reid"]
+        cap = int(rc.get("face_fusion", {}).get("max_faces_per_person", 12))
+        if frame_idx - self.last_face_frame < int(rc["gallery_min_interval"]):
+            return False
+        if self.face_embeddings.shape[0] == 0:
+            self.face_embeddings = emb[None, :].astype(np.float32)
+            self.face_quality = [quality]
+        elif self.face_embeddings.shape[0] < cap:
+            self.face_embeddings = np.vstack([self.face_embeddings, emb[None, :]])
+            self.face_quality.append(quality)
+        else:
+            worst = int(np.argmin(self.face_quality))
+            if quality <= self.face_quality[worst]:
+                return False
+            self.face_embeddings[worst] = emb
+            self.face_quality[worst] = quality
+        self.last_face_frame = frame_idx
+        return True
+
+    def face_score(self, query, topk):
+        if self.face_embeddings.shape[0] == 0 or query is None:
+            return None
+        sims = self.face_embeddings @ query
+        k = min(int(topk), sims.shape[0])
+        return float(np.sort(sims)[-k:].mean())
 
     def appearance_score(self, query, topk):
         """Cosine similarity of a query embedding against this person's bank."""
@@ -328,6 +365,8 @@ class PersonState:
             "gender_sample_count": len(self.gender_samples),
             "reentry_count": self.reentry_count,
             "embedding_count": int(self.embeddings.shape[0]),
+            "face_embedding_count": int(self.face_embeddings.shape[0]),
+            "embedding_frames": sorted(int(f) for f in self.emb_frame),
             "local_track_ids": self.local_track_ids,
             "total_visible_seconds": round(sum(s["end"] - s["start"] for s in self.segments), 3),
             "segments": [{"start": s["start"], "end": s["end"]} for s in self.segments],
@@ -340,8 +379,17 @@ class IdentityGallery:
     def __init__(self, cfg):
         self.cfg = cfg
         self.persons = {}
+        self.aliases = {}   # retired name -> the identity it was folded into
         self.names = NameGenerator(seed=cfg.get("seed", 1234))
         self._next_id = 0
+
+    def resolve(self, name):
+        """Follow merges to the identity a name ended up as."""
+        seen = set()
+        while name in self.aliases and name not in seen:
+            seen.add(name)
+            name = self.aliases[name]
+        return name
 
     def create(self, t_now):
         person = PersonState(self.names.next(), self._next_id, self.cfg, t_now)
@@ -355,7 +403,7 @@ class IdentityGallery:
             if p.name not in exclude_names and p.embeddings.shape[0] > 0
         ]
 
-    def match(self, query, t_now, center, frame_diag, exclude_names):
+    def match(self, query, t_now, center, frame_diag, exclude_names, face_query=None):
         """Score every candidate identity against one query embedding.
 
         Appearance is what gates the decision (`similarity_threshold` and
@@ -370,10 +418,25 @@ class IdentityGallery:
         sigma = float(rc["spatial_sigma"])
         max_gap = float(rc["spatial_max_gap_seconds"])
         topk = int(rc.get("match_topk", 2))
+        fc = rc.get("face_fusion", {}) or {}
+        face_on = bool(fc.get("enabled", False)) and face_query is not None
+        face_w = float(fc.get("weight", 0.2))
+        base_thr = float(rc["similarity_threshold"])
+        fused_thr = base_thr + float(fc.get("threshold_shift", -0.06))
 
         scored = []
         for person in self.candidates(exclude_names):
-            appearance = person.appearance_score(query, topk)
+            body = person.appearance_score(query, topk)
+            face = person.face_score(face_query, topk) if face_on else None
+            if face is None:
+                appearance, threshold = body, base_thr
+            else:
+                # Fusion measured on this footage: 0.8*body + 0.2*face lifts recall
+                # 0.72 -> 0.77 at the same false-merge rate. The fused score sits
+                # lower than a body-only score at equal confidence, hence its own
+                # (also measured) threshold rather than reusing the body one.
+                appearance = (1.0 - face_w) * body + face_w * face
+                threshold = fused_thr
             gap = max(0.0, t_now - person.last_seen)
             temporal = float(np.exp(-gap / tau))
             if person.last_center is not None and gap <= max_gap:
@@ -386,6 +449,9 @@ class IdentityGallery:
                 {
                     "person": person,
                     "appearance": appearance,
+                    "body": body,
+                    "face": face,
+                    "threshold": threshold,
                     "temporal": temporal,
                     "spatial": spatial,
                     "final": final,
@@ -395,14 +461,12 @@ class IdentityGallery:
         scored.sort(key=lambda s: s["final"], reverse=True)
         return scored
 
-    def merge(self, source, target, t_now, local_track_id):
-        """Fold a duplicate identity into the one it turned out to be.
-
-        Used when a track was named too early from a couple of weak crops and a
-        richer query later shows it is somebody the gallery already knows.
-        """
-        for emb, quality in zip(source.embeddings, source.emb_quality):
-            target.insert_embedding(emb, quality)
+    def absorb(self, source, target):
+        """Fold one stored identity into another and delete the duplicate."""
+        for emb, quality, fr in zip(source.embeddings, source.emb_quality, source.emb_frame):
+            target.insert_embedding(emb, quality, fr)
+        for emb, quality in zip(source.face_embeddings, source.face_quality):
+            target.store_face(emb, quality, target.last_face_frame + 10 ** 9)
         target.age_samples.extend(source.age_samples)
         target.gender_samples.extend(source.gender_samples)
         target.segments.extend(source.segments)
@@ -410,23 +474,60 @@ class IdentityGallery:
         target.first_seen = min(target.first_seen, source.first_seen)
         target.last_seen = max(target.last_seen, source.last_seen)
         target.last_demo_frame = max(target.last_demo_frame, source.last_demo_frame)
-        target.reentry_count += 1
+        target.reentry_count += source.reentry_count + 1
+        target.local_track_ids.extend(
+            t for t in source.local_track_ids if t not in target.local_track_ids
+        )
+        if source.best_crop is not None and source.best_crop_quality > target.best_crop_quality:
+            target.best_crop, target.best_crop_quality = source.best_crop, source.best_crop_quality
+        self.persons.pop(source.name, None)
+        self.aliases[source.name] = target.name
+        return target
+
+    def merge(self, source, target, t_now, local_track_id):
+        """Fold a duplicate identity into the one it turned out to be, and hand
+        the live track over to it.
+
+        Used when a track was named too early from a couple of weak crops and a
+        richer query later shows it is somebody the gallery already knows.
+        """
+        self.absorb(source, target)
         target.active = True
         target.current_local_track_id = local_track_id
-        target.local_track_ids.append(local_track_id)
+        if local_track_id not in target.local_track_ids:
+            target.local_track_ids.append(local_track_id)
         target.last_box, target.last_center = source.last_box, source.last_center
-        self.persons.pop(source.name, None)
         return target
 
     @staticmethod
-    def accept(scored, threshold, margin):
-        """Threshold + ambiguity check. When in doubt, refuse (a new person is
-        cheaper than merging two different people into one identity)."""
+    def accept(scored, threshold, margin, dup_thresholds=None):
+        """Threshold + ambiguity check.
+
+        Returns (accepted, duplicates). The ambiguity rule exists to stop two
+        DIFFERENT people who look alike being merged. It must not fire when the
+        rival is the same person already stored under a second name - otherwise
+        one duplicate breeds more duplicates: the returning person matches both
+        copies equally, gets refused, and a third copy is created. So a rival
+        whose own embedding bank matches the leader's is set aside as a
+        duplicate rather than treated as competing evidence.
+
+        Note the rivals are scanned by appearance, not by list order, because
+        `scored` is ranked by the combined score.
+        """
         if not scored:
-            return False
-        best = scored[0]["appearance"]
-        second = scored[1]["appearance"] if len(scored) > 1 else 0.0
-        return best >= threshold and (best - second) >= margin
+            return False, []
+        best = scored[0]
+        if best["appearance"] < best.get("threshold", threshold):
+            return False, []
+        duplicates = []
+        for rival in scored[1:]:
+            if best["appearance"] - rival["appearance"] >= margin:
+                continue                                    # not close enough to matter
+            if dup_thresholds and is_duplicate(best["person"], rival["person"], *dup_thresholds):
+                duplicates.append(rival["person"])          # same person, second name
+                continue
+            return False, []                                # a real rival - refuse
+        return True, duplicates
 
 
 class TrackState:
@@ -444,6 +545,7 @@ class TrackState:
         self.last_emb_frame = -10 ** 9
         self.pending = []            # (embedding, quality) collected before assignment
         self.history = []            # first N embeddings, for the later re-check
+        self.faces = []              # face embeddings seen so far (query side)
         self.reassessed = False
         self.banner_until = -1.0     # RE-ID MATCH overlay end time
         self.banner_similarity = 0.0
@@ -573,14 +675,87 @@ def draw_overlay(frame, tracks, gallery, live_ids, t_now, cfg, frame_idx, fps):
     return frame
 
 
-def _save_match_debug(debug_dir, person, prev_crop, new_crop, similarity, index):
+def _mean_unit(vectors):
+    """Average a list of unit vectors back onto the unit sphere (None if empty)."""
+    if not vectors:
+        return None
+    v = np.mean(np.stack(vectors), axis=0)
+    n = float(np.linalg.norm(v))
+    return None if n < 1e-9 else (v / n)
+
+
+def _reject_reason(scored, threshold, margin, duplicate_threshold=None):
+    """Say precisely WHY a candidate was refused - the two failure modes need
+    different fixes, so they must not share one label."""
+    if not scored:
+        return "empty_gallery"
+    best = scored[0]["appearance"]
+    second = max((c["appearance"] for c in scored[1:]), default=0.0)
+    if best < scored[0].get("threshold", threshold):
+        return "below_threshold"
+    if best - second < margin:
+        return "ambiguous"          # a genuinely different person looked just as similar
+    return "rejected"
+
+
+def bank_similarity(a, b, topk=2):
+    """Two ways of asking how alike two stored identities are.
+
+    peak  - mean of the top-K of ALL cross pairs. Answers "do these two banks
+            contain a pair of near-identical views?". Being a max-like statistic
+            over up to 400 pairs it is easily satisfied by chance, so it can
+            never be used on its own.
+    mean  - symmetric mean of each embedding's best match in the other bank.
+            Answers "do the banks agree BROADLY?", which a lucky pair cannot fake.
+
+    Calibrated on this footage against co-occurring tracks (people who are
+    provably different): peak>=0.90 alone false-merges 2.5% of pairs, and
+    peak>=0.82 - the value naively borrowed from similarity_threshold - fires on
+    12.9%. Requiring peak>=0.90 AND mean>=0.76 detects 83% of true duplicates at
+    a 0.7% false rate.
+    """
+    if a.embeddings.shape[0] == 0 or b.embeddings.shape[0] == 0:
+        return 0.0, 0.0
+    sims = a.embeddings @ b.embeddings.T
+    flat = sims.ravel()
+    k = min(topk, flat.size)
+    peak = float(np.sort(flat)[-k:].mean())
+    mean = float((sims.max(1).mean() + sims.max(0).mean()) / 2.0)
+    return peak, mean
+
+
+def is_duplicate(a, b, peak_thr, mean_thr):
+    """True when two stored identities are almost certainly the same person."""
+    peak, mean = bank_similarity(a, b)
+    return peak >= peak_thr and mean >= mean_thr
+
+
+def _top_candidates(scored, n=3):
+    top = scored[0]["person"] if scored else None
+    out = []
+    for c in scored[:n]:
+        row = {"person_name": c["person"].name,
+               "appearance": round(c["appearance"], 4),
+               "body": round(c["body"], 4),
+               "face": None if c.get("face") is None else round(c["face"], 4),
+               "gap_seconds": round(c["gap"], 2),
+               "embeddings": int(c["person"].embeddings.shape[0])}
+        if top is not None and c["person"] is not top:
+            peak, mean = bank_similarity(top, c["person"])
+            row["sim_to_top1"] = round(peak, 4)
+            row["mean_sim_to_top1"] = round(mean, 4)
+        out.append(row)
+    return out
+
+
+def _save_match_debug(debug_dir, person, prev_crop, new_crop, similarity, index, prefix=""):
     """Previous crop | new crop, side by side, so a wrong match is obvious."""
     os.makedirs(debug_dir, exist_ok=True)
     if new_crop is not None:
-        cv2.imwrite(os.path.join(debug_dir, f"{person.name}_reentry_{index:03d}.jpg"), new_crop)
+        cv2.imwrite(os.path.join(debug_dir, f"{prefix}{person.name}_reentry_{index:03d}.jpg"), new_crop)
     if prev_crop is None or new_crop is None:
         return
-    cv2.imwrite(os.path.join(debug_dir, f"{person.name}_previous.jpg"), prev_crop)
+    cv2.imwrite(os.path.join(debug_dir, f"{prefix}{person.name}_previous.jpg"), prev_crop)
 
     height = 320
     def _fit(img):
@@ -594,7 +769,7 @@ def _save_match_debug(debug_dir, person, prev_crop, new_crop, similarity, index)
     cv2.putText(header, f"{person.name}   similarity {similarity:.3f}", (10, 24),
                 FONT, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
     cv2.putText(header, "previous  |  re-entry", (10, 46), FONT, 0.5, (170, 170, 170), 1, cv2.LINE_AA)
-    cv2.imwrite(os.path.join(debug_dir, f"{person.name}_match_{index:03d}.jpg"),
+    cv2.imwrite(os.path.join(debug_dir, f"{prefix}{person.name}_match_{index:03d}.jpg"),
                 np.vstack([header, body]))
 
 
@@ -615,15 +790,22 @@ class Analyzer:
         self.reid = models.ReIDExtractor(cfg, self.device, self.stats)
         self.demographics = None
         self.face_detector = None
-        if cfg["demographics"].get("enabled", True):
+        self.face_embedder = None
+        face_fusion = (cfg["reid"].get("face_fusion") or {}).get("enabled", False)
+        if cfg["demographics"].get("enabled", True) or face_fusion:
             self.face_detector = models.FaceDetector(cfg, self.device, self.stats)
+        if cfg["demographics"].get("enabled", True):
             self.demographics = models.DemographicsEstimator(cfg, self.device, self.stats)
+        if face_fusion:
+            self.face_embedder = models.FaceEmbedder(cfg, self.device, self.stats)
 
         self.gallery = IdentityGallery(cfg)
         self.tracks = {}
         self.events = []
         self.frame_records = []
         self.match_counter = {}
+        self.reject_counter = 0
+        self.render_log = []
 
     # -- events ------------------------------------------------------------
     def _event(self, t_now, kind, person=None, local_track_id=None, **extra):
@@ -639,6 +821,39 @@ class Analyzer:
             print(f"[{kind.upper():<11}] t={t_now:7.2f}s  "
                   f"{(person.name if person else '-'):<12} local_track_id={local_track_id} {detail}")
         return ev
+
+    def _dup_threshold(self):
+        rc = self.cfg["reid"]
+        if not rc.get("merge_duplicates", True):
+            return None
+        return (float(rc.get("duplicate_peak_similarity", 0.90)),
+                float(rc.get("duplicate_mean_similarity", 0.76)))
+
+    def _fold_duplicates(self, duplicates, target, t_now, local_track_id):
+        """Heal the gallery: the same person stored under several names becomes one."""
+        for dup in duplicates:
+            if dup.name not in self.gallery.persons or dup is target:
+                continue
+            peak, mean = bank_similarity(target, dup)
+            self.gallery.absorb(dup, target)
+            self._event(t_now, "duplicate_merged", target, local_track_id,
+                        absorbed=dup.name, peak_similarity=round(peak, 4),
+                        mean_similarity=round(mean, 4))
+
+    def _save_reject_debug(self, scored, crop, t_now, local_track_id, stage):
+        """Dump near-miss comparisons so it is visible whether a refused match
+        was actually the same person (threshold too strict) or not (model limit)."""
+        dbg = self.cfg["debug"]
+        if not dbg.get("save_reject_crops", False) or crop is None or not scored:
+            return
+        best = scored[0]
+        if best["appearance"] < float(dbg.get("reject_crop_min_similarity", 0.6)):
+            return
+        out = os.path.join(dbg["reid_debug_dir"], "rejected")
+        self.reject_counter += 1
+        _save_match_debug(out, best["person"], best["person"].best_crop, crop,
+                          best["appearance"], self.reject_counter,
+                          prefix=f"REJECT_{stage}_t{t_now:.1f}s_track{local_track_id}_vs_")
 
     # -- identity assignment ----------------------------------------------
     def _busy_names(self, live_ids, own_track_id):
@@ -672,13 +887,28 @@ class Analyzer:
         center = ((tr.box[0] + tr.box[2]) / 2.0, (tr.box[1] + tr.box[3]) / 2.0)
         busy = self._busy_names(live_ids, tr.id) | {person.name}
 
-        scored = self.gallery.match(query, t_now, center, frame_diag, busy)
-        if not self.gallery.accept(scored, rc["similarity_threshold"], rc["second_best_margin"]):
+        scored = self.gallery.match(query, t_now, center, frame_diag, busy,
+                                    face_query=_mean_unit(tr.faces))
+        ok, duplicates = self.gallery.accept(
+            scored, rc["similarity_threshold"], rc["second_best_margin"], self._dup_threshold()
+        )
+        if not ok:
+            if scored and self.cfg["debug"].get("log_rejections", False):
+                self._event(
+                    t_now, "reid_reject", person, tr.id,
+                    reason=_reject_reason(scored, rc["similarity_threshold"], rc["second_best_margin"]),
+                    best_similarity=round(scored[0]["appearance"], 4),
+                    embeddings_used=len(tr.history),
+                    candidates=_top_candidates(scored),
+                )
+            self._save_reject_debug(scored, safe_crop(frame, tr.box), t_now, tr.id, "reassess")
             return
 
         best = scored[0]
-        target, second = best["person"], (scored[1]["appearance"] if len(scored) > 1 else 0.0)
+        target = best["person"]
+        second = max((c["appearance"] for c in scored[1:]), default=0.0)
         prev_crop, new_crop = target.best_crop, safe_crop(frame, tr.box)
+        self._fold_duplicates(duplicates, target, t_now, tr.id)
         merged = self.gallery.merge(person, target, t_now, tr.id)
 
         tr.person_name = merged.name
@@ -710,10 +940,13 @@ class Analyzer:
         center = ((tr.box[0] + tr.box[2]) / 2.0, (tr.box[1] + tr.box[3]) / 2.0)
 
         busy = self._busy_names(live_ids, tr.id)
-        scored = self.gallery.match(query, t_now, center, frame_diag, busy)
+        face_query = _mean_unit(tr.faces)
+        scored = self.gallery.match(query, t_now, center, frame_diag, busy, face_query=face_query)
         best = scored[0] if scored else None
-        second = scored[1]["appearance"] if len(scored) > 1 else 0.0
-        accepted = self.gallery.accept(scored, rc["similarity_threshold"], rc["second_best_margin"])
+        second = max((c["appearance"] for c in scored[1:]), default=0.0)
+        accepted, duplicates = self.gallery.accept(
+            scored, rc["similarity_threshold"], rc["second_best_margin"], self._dup_threshold()
+        )
 
         crop = safe_crop(frame, tr.box)
         if accepted:
@@ -721,6 +954,7 @@ class Analyzer:
             was_lost = not person.active
             gap = best["gap"]
             prev_crop = person.best_crop
+            self._fold_duplicates(duplicates, person, t_now, tr.id)
             person.bind(tr.id, t_now)
             if gap >= float(rc["min_reentry_gap_seconds"]):
                 person.reentry_count += 1
@@ -745,10 +979,14 @@ class Analyzer:
             person.bind(tr.id, t_now)
             self._event(
                 t_now, "new_person", person, tr.id,
+                reason=_reject_reason(scored, rc["similarity_threshold"], rc["second_best_margin"]),
                 best_similarity=round(best["appearance"], 4) if best else 0.0,
+                second_best_similarity=round(second, 4),
                 best_candidate=best["person"].name if best else None,
-                reason="below_threshold" if best else "empty_gallery",
+                embeddings_used=len(tr.pending),
+                candidates=_top_candidates(scored),
             )
+            self._save_reject_debug(scored, crop, t_now, tr.id, "assign")
 
         tr.person_name = person.name
         for emb, quality in tr.pending:
@@ -756,6 +994,13 @@ class Analyzer:
         tr.history = list(tr.pending)
         tr.pending.clear()
         return person
+
+    def _frame_faces(self, frame, cache):
+        """Face detection is run at most once per frame and shared by the face
+        ReID signal and the age/gender model."""
+        if cache[0] is None:
+            cache[0] = self.face_detector.detect(frame)
+        return cache[0]
 
     # -- demographics ------------------------------------------------------
     def _run_demographics(self, frame, live_ids, frame_idx, faces_cache):
@@ -777,9 +1022,7 @@ class Analyzer:
         if not due:
             return
 
-        if faces_cache[0] is None:
-            faces_cache[0] = self.face_detector.detect(frame)
-        faces = faces_cache[0]
+        faces = self._frame_faces(frame, faces_cache)
 
         body_crops, face_crops, owners, has_face = [], [], [], []
         for tr in due:
@@ -797,6 +1040,68 @@ class Analyzer:
             person = self.gallery.persons[tr.person_name]
             person.add_demographics(sample, tr.quality, hf)
             person.last_demo_frame = frame_idx
+
+    def _collect_faces(self, frame, tracks, faces_cache, frame_idx):
+        """Face embedding for each track that has a visible, large-enough face."""
+        faces = self._frame_faces(frame, faces_cache)
+        if len(faces) == 0:
+            return
+        owners, crops = [], []
+        for tr in tracks:
+            fbox = face_for_box(tr.box, faces)
+            crop = safe_crop(frame, fbox, pad=0.15) if fbox is not None else None
+            if self.face_embedder.usable(crop):
+                owners.append(tr)
+                crops.append(crop)
+        if not crops:
+            return
+        cap = int((self.cfg["reid"].get("face_fusion") or {}).get("max_query_faces", 8))
+        for tr, emb in zip(owners, self.face_embedder.extract(crops)):
+            if len(tr.faces) < cap:
+                tr.faces.append(emb)
+            if tr.person_name is not None:
+                self.gallery.persons[tr.person_name].store_face(emb, tr.quality, frame_idx)
+
+    # -- pass 2: draw the video from the FINAL identities -------------------
+    def _render_video(self, fps, width, height):
+        cfg = self.cfg
+        out = cfg["video"]["output"]
+        cap = cv2.VideoCapture(cfg["video"]["input"])
+        writer = cv2.VideoWriter(out, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+        if not writer.isOpened():
+            raise RuntimeError(f"cannot open video writer for {out}")
+
+        t0 = time.perf_counter()
+        by_frame = dict(self.render_log)
+        first = self.render_log[0][0] if self.render_log else 0
+        if first:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, first)
+
+        written = 0
+        for frame_idx, entries in self.render_log:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            live, tracks = [], {}
+            for e in entries:
+                name = self.gallery.resolve(e["name"]) if e["name"] else None
+                if name is not None and name not in self.gallery.persons:
+                    name = None
+                shim = TrackState(e["tid"], frame_idx, frame_idx / fps)
+                shim.box = np.array(e["box"], np.float32)
+                shim.person_name = name
+                shim.banner_until = float("inf") if e["banner"] else -1.0
+                shim.banner_similarity = e["sim"]
+                tracks[e["tid"]] = shim
+                live.append(e["tid"])
+            draw_overlay(frame, tracks, self.gallery, live, frame_idx / fps, cfg, frame_idx, fps)
+            writer.write(frame)
+            written += 1
+            if written % 200 == 0:
+                print(f"  ... rendering {written}/{len(self.render_log)}")
+        cap.release()
+        writer.release()
+        print(f"[video] pass 2 rendered {written} frames in {time.perf_counter() - t0:.1f}s")
 
     # -- main loop ---------------------------------------------------------
     def run(self):
@@ -816,12 +1121,21 @@ class Analyzer:
         if start_frame:
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
-        writer = cv2.VideoWriter(vcfg["output"], cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-        if not writer.isOpened():
-            raise RuntimeError(f"cannot open video writer for {vcfg['output']}")
+        # Two-pass: analyse first, draw afterwards. A name assigned from two weak
+        # crops is often corrected a second later, and a single-pass video keeps
+        # the discarded name burnt into every frame already written. Pass 2
+        # redraws from the FINAL identities, so what you watch matches the JSON.
+        self.two_pass = bool(vcfg.get("two_pass", True))
+        writer = None
+        if not self.two_pass:
+            writer = cv2.VideoWriter(vcfg["output"], cv2.VideoWriter_fourcc(*"mp4v"),
+                                     fps, (width, height))
+            if not writer.isOpened():
+                raise RuntimeError(f"cannot open video writer for {vcfg['output']}")
 
         print(f"[video] {vcfg['input']}  {width}x{height} @ {fps:.2f}fps  {total} frames")
-        print(f"[video] writing {vcfg['output']}")
+        print(f"[video] {'two-pass render' if self.two_pass else 'streaming render'} "
+              f"-> {vcfg['output']}")
 
         rc = cfg["reid"]
         reassess_n = int(rc.get("reassess_embeddings", 8))
@@ -869,9 +1183,12 @@ class Analyzer:
                 elif frame_idx - tr.last_emb_frame >= int(rc["extraction_interval"]):
                     need.append(tr)
 
+            faces_cache = [None]
             if need:
                 crops = [safe_crop(frame, tr.box) for tr in need]
                 keep = [(tr, c) for tr, c in zip(need, crops) if c is not None]
+                if keep and self.face_embedder is not None:
+                    self._collect_faces(frame, [tr for tr, _ in keep], faces_cache, frame_idx)
                 if keep:
                     embeddings = self.reid.extract([c for _, c in keep])
                     for (tr, crop), emb in zip(keep, embeddings):
@@ -889,9 +1206,9 @@ class Analyzer:
                             if not tr.reassessed and len(tr.history) >= reassess_n:
                                 self._reassess_identity(tr, frame, t_now, live_ids, frame_diag)
 
-            # 3) age / gender (at most one face-detector pass per frame)
+            # 3) age / gender (reuses this frame's face detection)
             if self.demographics is not None:
-                self._run_demographics(frame, live_ids, frame_idx, [None])
+                self._run_demographics(frame, live_ids, frame_idx, faces_cache)
 
             # 4) retire local tracks; their identity survives in the gallery
             for tid in list(self.tracks):
@@ -911,9 +1228,19 @@ class Analyzer:
                                                           - person.segments[-1]["start"], 2))
                 del self.tracks[tid]
 
-            # 5) draw + write
-            draw_overlay(frame, self.tracks, self.gallery, live_ids, t_now, cfg, frame_idx, fps)
-            writer.write(frame)
+            # 5) render now, or remember what to render in pass 2
+            if self.two_pass:
+                self.render_log.append((frame_idx, [
+                    {"tid": t,
+                     "box": [float(v) for v in self.tracks[t].box],
+                     "name": self.tracks[t].person_name,
+                     "banner": bool(t_now <= self.tracks[t].banner_until),
+                     "sim": float(self.tracks[t].banner_similarity)}
+                    for t in live_ids
+                ]))
+            else:
+                draw_overlay(frame, self.tracks, self.gallery, live_ids, t_now, cfg, frame_idx, fps)
+                writer.write(frame)
 
             if cfg["debug"].get("save_frame_results", False):
                 self.frame_records.append({
@@ -939,22 +1266,27 @@ class Analyzer:
                       f"people={len(self.gallery.persons)}")
 
         cap.release()
-        writer.release()
+        if writer is not None:
+            writer.release()
 
         # close whatever is still open at the end of the video
         end_t = (frame_idx - 1) / fps
         for tr in self.tracks.values():
-            if tr.person_name is not None:
-                person = self.gallery.persons[tr.person_name]
-                if person.current_local_track_id == tr.id:
-                    person.unbind()
-                    self._event(end_t, "track_end", person, tr.id, reason="video_end")
+            if tr.person_name is None:
+                continue
+            person = self.gallery.persons.get(self.gallery.resolve(tr.person_name))
+            if person is not None and person.current_local_track_id == tr.id:
+                person.unbind()
+                self._event(end_t, "track_end", person, tr.id, reason="video_end")
 
+        analysis_wall = time.perf_counter() - wall0
+        if self.two_pass:
+            self._render_video(fps, width, height)
         wall = time.perf_counter() - wall0
-        return self._finish(processed, wall, fps)
+        return self._finish(processed, wall, fps, analysis_wall)
 
     # -- outputs -----------------------------------------------------------
-    def _finish(self, processed, wall, fps):
+    def _finish(self, processed, wall, fps, analysis_wall=None):
         cfg = self.cfg
         out_dir = cfg["video"]["output_dir"]
         persons = sorted(self.gallery.persons.values(), key=lambda p: p.first_seen)
@@ -996,8 +1328,12 @@ class Analyzer:
         print(f"  input fps                : {fps:.2f}")
         print(f"  frames processed         : {processed}")
         print(f"  total processing time    : {wall:.1f} s")
+        if analysis_wall is not None and analysis_wall < wall:
+            print(f"    analysis pass          : {analysis_wall:.1f} s "
+                  f"({processed / max(1e-9, analysis_wall):.2f} fps)")
+            print(f"    render pass            : {wall - analysis_wall:.1f} s")
         print(f"  processing fps           : {processed / max(1e-9, wall):.2f}")
-        for name in ("detector", "reid", "face_detector", "demographics"):
+        for name in ("detector", "reid", "face_detector", "face_embed", "demographics"):
             if name in report:
                 r = report[name]
                 print(f"  {name:<24} : {r['total_s']:7.1f} s   {r['ms_per_call']:6.1f} ms/call   "
@@ -1020,6 +1356,7 @@ class Analyzer:
             "events": self.events,
             "performance": {
                 "input_fps": round(fps, 3),
+                "analysis_seconds": None if analysis_wall is None else round(analysis_wall, 3),
                 "frames_processed": processed,
                 "processing_seconds": round(wall, 3),
                 "processing_fps": round(processed / max(1e-9, wall), 3),

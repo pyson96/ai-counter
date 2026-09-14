@@ -91,7 +91,7 @@ reid:
   # used to link people inside this one video - never against any external
   # database - and the embeddings are discarded when the run ends.
   face_fusion:
-    enabled: true
+    enabled: false
     weight: 0.2              # share of the fused score taken by the face
     threshold_shift: -0.06   # fused scores sit lower; measured offset
     min_face_pixels: 24      # smaller faces carry no usable signal

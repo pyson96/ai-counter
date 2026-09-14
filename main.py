@@ -72,16 +72,25 @@ def main(argv=None):
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--input", default=None, help="override video.input")
     ap.add_argument("--output", default=None, help="override video.output")
+    ap.add_argument("--output-dir", default=None,
+                    help="override video.output_dir - use it for trial runs so they do not "
+                         "overwrite output/persons.json and output/reid_events.json")
     ap.add_argument("--max-frames", type=int, default=None, help="stop after N frames")
     ap.add_argument("--start-frame", type=int, default=None)
     ap.add_argument("--no-demographics", action="store_true", help="skip age/gender estimation")
     ap.add_argument("--cpu", action="store_true", help="force CPU (slow)")
     ap.add_argument("--quiet", action="store_true", help="do not print per-event lines")
     ap.add_argument("--download-weights", action="store_true", help="fetch checkpoints and exit")
+    ap.add_argument("--reid-model", default=None,
+                    help="which SOLIDER backbone to download (default: the one in config.yaml)")
     args = ap.parse_args(argv)
 
     if args.download_weights:
-        download_weights(["yolo11x.pt", "yolov8x_person_face.pt", "solider_swin_base_msmt17.pth"])
+        reid = args.reid_model
+        if reid is None:
+            with open(args.config, "r", encoding="utf-8") as fh:
+                reid = yaml.safe_load(fh)["reid"]["model"]
+        download_weights(["yolo11x.pt", "yolov8x_person_face.pt", f"{reid}_msmt17.pth"])
         return 0
 
     cfg = load_config(
@@ -89,6 +98,7 @@ def main(argv=None):
         {
             "video.input": args.input,
             "video.output": args.output,
+            "video.output_dir": args.output_dir,
             "video.max_frames": args.max_frames,
             "video.start_frame": args.start_frame,
         },
@@ -100,6 +110,13 @@ def main(argv=None):
         cfg["device"]["fp16"] = False
     if args.quiet:
         cfg["debug"]["verbose"] = False
+
+    # keep the debug directory inside whichever output dir is in use
+    if args.output_dir:
+        cfg["debug"]["reid_debug_dir"] = os.path.join(args.output_dir, "reid_debug")
+        if args.output is None:
+            cfg["video"]["output"] = os.path.join(args.output_dir, "result.mp4")
+        os.makedirs(cfg["debug"]["reid_debug_dir"], exist_ok=True)
 
     if not os.path.exists(cfg["video"]["input"]):
         print(f"input video not found: {cfg['video']['input']}", file=sys.stderr)

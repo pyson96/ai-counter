@@ -3,3 +3,11 @@
 *.pth
 *.pt
 *.mp4
+/output_car
+/out_A
+/out_B
+/out_t6_face
+/output_diag
+/output_smoke
+/output_t6
+/weights

@@ -25,3 +25,10 @@ huggingface_hub>=0.24
 # weight downloads
 gdown>=5.0
 lap>=0.5                  # ByteTrack assignment solver
+
+# --- detect_car.py (license plate detection + Korean OCR) -------------------
+# PP-OCRv5 runs as ONNX rather than through paddleocr: no paddlepaddle install,
+# and it shares the GPU with YOLO. pyclipper/shapely are the DB post-process.
+onnxruntime-gpu>=1.20   # use onnxruntime (CPU) if you have no CUDA GPU
+pyclipper>=1.3
+shapely>=2.0
