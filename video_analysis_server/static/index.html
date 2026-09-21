@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Video Analysis Server</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <h1>Video Analysis</h1>
+  <div id="health" class="health">&nbsp;</div>
+</header>
+
+<div id="insecure" class="insecure hidden">
+  <b>http로 접속 중입니다.</b>
+  브라우저가 이 주소에서는 화면 꺼짐 방지를 허용하지 않아, 긴 업로드 중
+  화면이 꺼지면 속도가 크게 떨어집니다.
+  <a id="https-link" href="#">https 주소로 열기</a>
+  <small>처음 한 번 "안전하지 않음 / 고급 → 계속" 을 눌러 인증서를 허용해야 합니다.</small>
+</div>
+
+<main>
+  <section class="card upload-card">
+    <label class="filebtn">
+      <input type="file" id="file" accept="video/*,.mp4,.mov,.mkv,.avi">
+      <span>Upload Video</span>
+    </label>
+    <fieldset class="preset">
+      <legend>업로드 후 자동 분석</legend>
+      <label><input type="radio" name="preset" value="" checked> 직접 선택</label>
+      <label><input type="radio" name="preset" value="person"> 사람 분석</label>
+      <label><input type="radio" name="preset" value="vehicle"> 차량 분석</label>
+      <label class="chk preset-video">
+        <input type="checkbox" id="preset-video"> 결과 영상 생성
+      </label>
+      <p class="hint" id="preset-hint"></p>
+    </fieldset>
+    <p class="hint">
+      큰 파일은 브라우저에서 잘라 조각 단위로 올라갑니다.
+      끊겨도 같은 파일을 다시 고르면 이어집니다.
+    </p>
+    <div id="repick" class="repick hidden">
+      <b>휴대폰이 파일을 놓쳤습니다.</b>
+      올라간 부분은 서버에 그대로 있습니다. 같은 영상을 다시 고르면 이어서 올라갑니다.
+      <button type="button" id="repick-btn">파일 다시 선택</button>
+    </div>
+    <div class="nettest">
+      <button type="button" id="nettest" class="ghost">연결 진단</button>
+      <span class="hint" id="nettest-out">업로드가 계속 실패하면 눌러보세요</span>
+    </div>
+    <div id="current"></div>
+  </section>
+
+  <section>
+    <h2>Videos &amp; Jobs</h2>
+    <div id="list" class="list"><p class="empty">Nothing uploaded yet.</p></div>
+  </section>
+</main>
+
+<!-- analysis type + ROI configuration -->
+<div id="modal" class="modal hidden">
+  <div class="sheet">
+    <div class="sheet-head">
+      <strong id="modal-title">Choose analysis</strong>
+      <button class="icon" id="modal-close">&times;</button>
+    </div>
+
+    <div id="step-type" class="step">
+      <p class="hint">
+        분석 종류만 고르면 바로 대기열에 들어갑니다. 다른 영상을 분석 중이면
+        끝나는 대로 순서대로 자동 실행됩니다.
+      </p>
+      <button class="big person" data-type="person">사람 분석
+        <small>입·퇴장 수, 나이, 성별, 시간대별 방문객 · ROI는 분석 후 설정</small></button>
+      <button class="big vehicle" data-type="vehicle">차량 분석
+        <small>번호판, 입·출차 · 전체 프레임이 ROI</small></button>
+      <label class="chk videoopt">
+        <input type="checkbox" class="opt-video">
+        <span>결과 영상 생성
+          <em>박스 · ID · 입퇴장 카운트를 그려 넣은 mp4를 만듭니다.
+              영상을 한 번 더 디코딩하므로 분석 시간이 늘어납니다.</em></span>
+      </label>
+      <p class="note" id="type-msg"></p>
+    </div>
+
+  </div>
+</div>
+
+<script src="upload.js"></script>
+</body>
+</html>

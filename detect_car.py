@@ -691,7 +691,9 @@ class PlateReader:
         self.vehicles_model = YOLO(args.vehicle_weights)
         self.plates_model = YOLO(args.plate_weights)
         self.ocr = PaddleOCR(args.ocr_dir, use_gpu=not args.cpu)
-        self.renderer = Renderer(args.font)
+        # The renderer needs a Hangul TTF and PIL; an analysis-only run (the web
+        # server never writes a result video) must not require either.
+        self.renderer = None if getattr(args, "no_render", False) else Renderer(args.font)
         self.tracks: dict[int, Vehicle] = {}
         self.recent: deque[int] = deque(maxlen=64)
         print(f"[ocr] onnxruntime provider: {self.ocr.provider}")

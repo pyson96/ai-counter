@@ -22,6 +22,13 @@ huggingface_hub>=0.24
 #   pip install --no-deps --no-build-isolation git+https://github.com/WildChlamydia/MiVOLO.git
 # (see README). --no-deps is required so it does not downgrade ultralytics to 8.1.
 
+# Face embeddings for the ReID face-fusion second opinion (models.FaceEmbedder).
+# --no-deps on install: it pins older torch/torchvision pins that would otherwise
+# downgrade the CUDA build installed above. Everything it actually imports
+# (torch, torchvision, numpy, pillow, requests) is already present.
+#   pip install --no-deps facenet-pytorch
+facenet-pytorch>=2.6
+
 # weight downloads
 gdown>=5.0
 lap>=0.5                  # ByteTrack assignment solver

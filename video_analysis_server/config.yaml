@@ -1,0 +1,140 @@
+# ---------------------------------------------------------------------------
+# Web video-analysis server configuration.
+#
+# Everything that describes the AI itself (detector weights, ReID thresholds,
+# MiVOLO cadence, ...) still lives in the project-root config.yaml - this file
+# only adds what the server needs, plus the few analysis knobs the web workflow
+# introduces. `analysis.base_config` points at the root file and the two are
+# deep-merged, root first.
+# ---------------------------------------------------------------------------
+
+server:
+  host: 0.0.0.0
+  port: 7802
+  # HTTPS on a second port. A phone needs a SECURE origin for the screen
+  # wake lock that keeps a multi-hour upload alive when the screen blanks -
+  # plain http:// on a LAN address is not one. The certificate is self-signed
+  # and generated on first start; the phone is asked once to trust it.
+  # Set to 0 to disable HTTPS.
+  https_port: 7803
+  cert_dir: data/certs
+  # 휴대폰이 실제로 입력하는 주소. 공유기 포트포워딩 뒤의 공인 IP나 도메인을
+  # 넣어야 인증서가 그 주소로 유효해진다. 여러 개 가능.
+  cert_hosts:
+    - 183.98.62.106
+
+upload:
+  chunk_size_mb: 32           # what the browser is told to slice the file into
+  resumable: true
+  max_file_gb: 200
+
+video:
+  max_frames: 0                 # 0 = whole video. A small number gives a quick
+  start_frame: 0              # smoke-test run of the full server workflow.
+
+analysis:
+  max_gpu_jobs: 1             # one video on the GPU at a time. Do not raise it.
+  base_config: ../config.yaml # project-root analysis config (deep-merged first)
+  poll_seconds: 2.0           # how often the worker looks for a queued job
+  progress_interval: 50       # frames between job-progress DB updates
+
+person:
+  ground_band_ratio: 0.15     # bottom 15% of the bbox is the ground contact band
+  age_groups:                 # label: [min_age, max_age_exclusive]
+    under_20: [0, 20]
+    20s: [20, 30]
+    30s: [30, 40]
+    40s: [40, 50]
+    50s: [50, 60]
+    60_plus: [60, 200]
+  time_bucket_seconds: 300    # width of the time-window visitor histogram
+  heatmap:
+    enabled: true             # dwell heatmap over the bottom-band ground point
+    cols: 64                  # grid width; rows follow the video aspect ratio
+
+# ---------------------------------------------------------------------------
+# Track-position history. Every visible person's bbox is stored at this rate so
+# Entry/Exit ROIs can be (re)calculated long after the source video is gone.
+# This is a STORAGE rate only - detection, tracking, ReID and MiVOLO all keep
+# running at their own cadence, untouched.
+# ---------------------------------------------------------------------------
+tracks:
+  enabled: true
+  sample_fps: 5.0             # samples per second of VIDEO time, not wall time
+  bbox_decimals: 1
+
+roi:
+  enter_frames: 3             # consecutive inside frames before ENTRY is counted
+  exit_frames: 5              # consecutive outside frames before the lane rearms
+  min_repeat_seconds: 2.0     # same identity + same ROI may not re-fire faster
+  count_first_seen_inside: false
+
+  # --- crossing line (the current counting rule) ---------------------------
+  # One line with an inside and an outside, drawn on the /result page after
+  # analysis. Crossing it inward is an entry, outward an exit. A doorway is a
+  # threshold, not an area: with two polygons the count depended on whether
+  # somebody lingered in a region, and a person walking straight through could
+  # register both, either or neither.
+  confirm_frames: 3          # consecutive frames on the new side before it flips
+  hysteresis_px: 8           # dead band around the line; no judgement inside it
+
+  # How a ROI arrival turns into a count.
+  #
+  # transition (default): only movement BETWEEN the two regions counts.
+  #     Exit ROI -> Entry ROI  =  entry + 1
+  #     Entry ROI -> Exit ROI  =  exit  + 1
+  #   The two polygons are the outside and the inside of a threshold, and
+  #   walking into either one from anywhere else (off-camera, the middle of the
+  #   room) is recorded but not counted. Passing over un-covered floor between
+  #   the two is fine - only the last region the person was in matters.
+  #
+  # independent: every arrival in a region counts on its own. Right when the
+  #   two regions are unrelated areas rather than two sides of one doorway.
+  count_mode: transition
+
+  # Only read in "independent" mode: drop exits by people who were never
+  # counted in. In "transition" mode the ordering is inherent in the rule.
+  require_entry_before_exit: false
+
+vehicle:
+  lost_seconds: 3.0           # undetected for this long -> LEFT_FRAME
+  min_plate_score: 0.8        # plate grammar score required to trust a reading
+  min_reads: 2                # OCR votes required before a plate is "stable"
+  plate_interval: 2           # run plate detection every N frames
+  ocr_interval: 3             # min frames between OCR runs for one vehicle
+  imgsz: 960
+  vehicle_conf: 0.35
+  min_vehicle_size: 48
+  crop_size: 640
+  plate_imgsz: 640
+  plate_conf: 0.25
+  batch: 8
+  ocr_height: 96
+  ocr_conf: 0.35
+  min_quality: 0.12
+  max_reads: 12
+  time_bucket_seconds: 300
+
+storage:
+  # Every large or per-job artifact lives under this root, off the project tree:
+  #     <video_root>/uploads/<upload_id>/upload.part   resumable chunk file
+  #     <video_root>/uploads/<upload_id>/source.<ext>  assembled source video
+  #     <video_root>/results/<job_id>/                 all result files
+  # Only the SQLite database stays beside the server, under data/.
+  video_root: F:/videos
+  # SQLite database. Omit the key to keep it beside the server under data/
+  # (that is what the two remote machines do); set it to put the database on
+  # the same volume as the videos.
+  db_path: F:/videos/analysis.db
+  keep_first_frame: true          # one JPEG per job, kept as the dashboard backdrop
+  delete_source_after_success: false   # 원본 보존: 검증 후에도 삭제하지 않음
+  keep_source_video: true              # 원본 보존
+  # Annotated result video. This key only decides whether the option is OFFERED;
+  # each job renders one solely because its own "결과 영상 생성" box was ticked
+  # (jobs.create_video), and that box is unchecked by default. Set this to false
+  # to remove the option entirely and go back to structured-output-only.
+  allow_result_video: true
+  keep_result_video: true         # a rendered video survives the cleanup step
+  keep_json: true
+  keep_database_results: true
+  weights_dir: ../weights

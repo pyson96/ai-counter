@@ -11,3 +11,7 @@
 /output_smoke
 /output_t6
 /weights
+/video_analysis_server/__pycache__
+/video_analysis_server/analyzer/__pycache__
+logs/server.err.log
+*.log

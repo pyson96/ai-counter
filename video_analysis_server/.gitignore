@@ -1,0 +1,3 @@
+# Runtime state: uploads, chunks, results and the SQLite database.
+# The directories themselves are recreated on startup by analyzer.ensure_dirs().
+data/

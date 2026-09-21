@@ -19,7 +19,9 @@ no attempt is made to recognise who anybody actually is.
 
 from __future__ import annotations
 
+import gzip
 import json
+import math
 import os
 import random
 import time
@@ -155,6 +157,369 @@ def face_for_box(person_box, faces):
         if area > best_area:
             best, best_area = (fx1, fy1, fx2, fy2), area
     return best
+
+
+# ---------------------------------------------------------------------------
+# ground position + Entry/Exit ROI state machine
+# ---------------------------------------------------------------------------
+
+DEFAULT_GROUND_BAND_RATIO = 0.15
+
+
+def person_ground_point(box, band_ratio=DEFAULT_GROUND_BAND_RATIO):
+    """Where the person is STANDING, from their bounding box.
+
+    The camera sits on a ~2 m tripod and the Entry/Exit ROIs are floor regions,
+    so the head is the wrong thing to test against them - the feet are what is
+    inside the polygon. The exact bottom line y2 jitters by several pixels every
+    frame, so instead of that single line we take the bottom `band_ratio` slice
+    of the box and use its centre:
+
+        +---------------+
+        |               |
+        |    person     |
+        +---------------+  <- y1 + h * (1 - band_ratio)
+        | bottom band  o|  <- the returned point sits in the middle of it
+        +---------------+  <- y2
+
+    With the default 0.15 that is (cx, y1 + h * 0.925). One helper, used by the
+    whole pipeline - do not recompute this rule anywhere else.
+    """
+    x1, y1, x2, y2 = (float(v) for v in box[:4])
+    height = y2 - y1
+    band_ratio = min(max(float(band_ratio), 0.0), 1.0)
+    band_start = y1 + height * (1.0 - band_ratio)
+    return ((x1 + x2) / 2.0, band_start + (y2 - band_start) / 2.0)
+
+
+def person_ground_band(box, band_ratio=DEFAULT_GROUND_BAND_RATIO):
+    """The bottom-band rectangle itself (x1, band_start_y, x2, y2)."""
+    x1, y1, x2, y2 = (float(v) for v in box[:4])
+    band_ratio = min(max(float(band_ratio), 0.0), 1.0)
+    return (x1, y1 + (y2 - y1) * (1.0 - band_ratio), x2, y2)
+
+
+def point_in_polygon(point, polygon):
+    """Even-odd ray casting. `polygon` is [[x, y], ...] in video pixels."""
+    x, y = point
+    inside = False
+    n = len(polygon)
+    if n < 3:
+        return False
+    j = n - 1
+    for i in range(n):
+        xi, yi = polygon[i][0], polygon[i][1]
+        xj, yj = polygon[j][0], polygon[j][1]
+        if (yi > y) != (yj > y):
+            cross = xi + (y - yi) * (xj - xi) / ((yj - yi) or 1e-9)
+            if x < cross:
+                inside = not inside
+        j = i
+    return inside
+
+
+DEFAULT_LINE_HYSTERESIS_PX = 8.0
+DEFAULT_LINE_CONFIRM = 3
+
+
+def line_segments(points):
+    """[[x,y], ...] -> [((ax,ay),(bx,by)), ...]. Fewer than 2 points = no line."""
+    pts = [(float(p[0]), float(p[1])) for p in (points or []) if len(p) >= 2]
+    return [(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
+
+
+def signed_side_of_line(point, points):
+    """Which side of the line a point falls on: +1, -1, or 0 when undecidable.
+
+    0 means "do not judge": the point is past the end of the line (they walked
+    around it, they did not cross it) or exactly on it. Distance to the nearest
+    segment decides which segment's orientation applies, so a bent line works
+    the same as a straight one.
+
+    The sign is arbitrary but CONSISTENT - which of the two is "inside" is the
+    user's choice, stored alongside the line.
+    """
+    best = None
+    px, py = float(point[0]), float(point[1])
+    segments = line_segments(points)
+    last = len(segments) - 1
+    for idx, ((ax, ay), (bx, by)) in enumerate(segments):
+        vx, vy = bx - ax, by - ay
+        length2 = vx * vx + vy * vy
+        if length2 <= 0.0:
+            continue
+        t = ((px - ax) * vx + (py - ay) * vy) / length2
+        clamped = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+        dx, dy = px - (ax + vx * clamped), py - (ay + vy * clamped)
+        distance = math.hypot(dx, dy)
+        if best is None or distance < best[0]:
+            best = (distance, vx * (py - ay) - vy * (px - ax), t, idx)
+    if best is None:
+        return 0, 0.0
+    distance, cross, t, idx = best
+    # Only the two ENDS of the whole line are blind: past them somebody walked
+    # around the line rather than through it. An interior corner is not a gap -
+    # on the outside of a bend no segment has the point within its span, and
+    # refusing to judge there left a wedge where an approach went unseen, so
+    # the crossing itself was never the first thing observed.
+    if (idx == 0 and t < 0.0) or (idx == last and t > 1.0):
+        return 0, distance
+    if cross == 0.0:
+        return 0, distance
+    return (1 if cross > 0 else -1), distance
+
+
+class CrossingLine:
+    """One line with an inside and an outside; crossing it is the event.
+
+        outside -> inside   ENTRY
+        inside  -> outside  EXIT
+
+    This replaces the two-polygon scheme. A doorway is a threshold, not two
+    areas: with polygons the counts depended on whether somebody happened to
+    stand inside a region long enough, and a person walking straight through
+    could register both, either or neither. A line has no interior to linger
+    in - you are on one side or the other, and only changing sides counts.
+
+    Two kinds of jitter are handled:
+
+    * the box wobbles on the line itself. `hysteresis_px` is a dead band around
+      the line where no judgement is made at all, so a foot placed on the
+      threshold does not produce a burst of crossings;
+    * one bad frame puts the box on the far side. `confirm_frames` consecutive
+      observations on the new side are required before the side actually flips.
+
+    Walking around the END of the line is not a crossing, so observations past
+    either endpoint are ignored (see signed_side_of_line).
+
+    State is per local track, because that is what is observable frame to
+    frame; the caller re-attributes the event to the persistent ReID identity,
+    which may only be assigned seconds later.
+    """
+
+    def __init__(self, points, inside=1, confirm_frames=DEFAULT_LINE_CONFIRM,
+                 hysteresis_px=DEFAULT_LINE_HYSTERESIS_PX):
+        self.points = [[float(p[0]), float(p[1])] for p in (points or []) if len(p) >= 2]
+        self.inside = 1 if int(inside or 1) >= 0 else -1
+        self.confirm_frames = max(1, int(confirm_frames))
+        self.hysteresis_px = max(0.0, float(hysteresis_px))
+        self.states = {}                 # local_track_id -> lane
+
+    @property
+    def active(self):
+        return len(self.points) >= 2
+
+    def side_of(self, point):
+        """+1 / -1 / 0, with the dead band applied."""
+        side, distance = signed_side_of_line(point, self.points)
+        if side == 0 or distance < self.hysteresis_px:
+            return 0
+        return side
+
+    def label(self, side):
+        return "entry" if side == self.inside else "exit"
+
+    def update(self, track_id, point, t_now=None):
+        """Feed one observation. Returns "entry", "exit", or None.
+
+        The first decisive observation of a track only establishes which side it
+        started on - somebody already inside when the recording starts has not
+        entered, and counting them would inflate every total.
+        """
+        if not self.active:
+            return None
+        side = self.side_of(point)
+        if side == 0:
+            return None                  # on the line, or past its end
+        lane = self.states.get(track_id)
+        if lane is None:
+            self.states[track_id] = {"side": side, "candidate": 0, "streak": 0}
+            return None                  # where they began, not a crossing
+        if side == lane["side"]:
+            lane["candidate"] = 0
+            lane["streak"] = 0
+            return None
+        if lane["candidate"] == side:
+            lane["streak"] += 1
+        else:
+            lane["candidate"] = side
+            lane["streak"] = 1
+        if lane["streak"] < self.confirm_frames:
+            return None
+        lane["side"] = side
+        lane["candidate"] = 0
+        lane["streak"] = 0
+        return self.label(side)
+
+    def drop(self, track_id):
+        self.states.pop(track_id, None)
+
+
+def build_crossing_line(roi_cfg, analysis_fps=None, sample_fps=None):
+    """A CrossingLine from config, or None when no line is configured.
+
+    `confirm_frames` is tuned at the analysis frame rate. When the same rule is
+    replayed against the 5 Hz track history the threshold is restated in
+    samples, so the two paths behave the same in SECONDS rather than in frames.
+    """
+    cfg = roi_cfg or {}
+    line = cfg.get("line") or cfg.get("crossing_line") or []
+    if len(line) < 2:
+        return None
+    confirm = int(cfg.get("confirm_frames", DEFAULT_LINE_CONFIRM))
+    if analysis_fps and sample_fps:
+        seconds = confirm / (float(analysis_fps) or 30.0)
+        confirm = max(1, int(math.ceil(seconds * float(sample_fps))))
+    return CrossingLine(
+        line,
+        inside=cfg.get("inside", 1),
+        confirm_frames=confirm,
+        hysteresis_px=float(cfg.get("hysteresis_px", DEFAULT_LINE_HYSTERESIS_PX)),
+    )
+
+
+class ROIMonitor:
+    """Debounced OUTSIDE -> ENTERING -> INSIDE transitions for one polygon.
+
+    A detection box wobbles around the polygon edge, so a single frame that
+    happens to overlap is not an event: `enter_frames` consecutive inside
+    frames are required before one is emitted, and `exit_frames` consecutive
+    outside frames before the lane can fire again. That is the whole
+    anti-double-counting rule - while somebody stands inside the ROI their
+    state stays INSIDE and nothing more is counted.
+
+    State is kept per local track, because that is what is observable frame to
+    frame; the emitted event carries the track id and the caller re-attributes
+    it to the persistent ReID identity (which may only be assigned, or merged
+    into somebody else, several seconds later).
+    """
+
+    OUTSIDE, ENTERING, INSIDE, LEAVING = "OUTSIDE", "ENTERING", "INSIDE", "LEAVING"
+
+    def __init__(self, kind, polygon, enter_frames=3, exit_frames=5,
+                 count_first_seen_inside=False):
+        self.kind = kind                       # "entry" | "exit"
+        self.polygon = [[float(p[0]), float(p[1])] for p in (polygon or [])]
+        self.enter_frames = max(1, int(enter_frames))
+        self.exit_frames = max(1, int(exit_frames))
+        self.count_first_seen_inside = bool(count_first_seen_inside)
+        self.states = {}                       # local_track_id -> dict
+
+    @property
+    def active(self):
+        return len(self.polygon) >= 3
+
+    def _lane(self, track_id, inside_now):
+        lane = self.states.get(track_id)
+        if lane is None:
+            # A track born INSIDE the ROI is almost always an id switch of
+            # somebody already standing there, so it starts as INSIDE and is
+            # not counted unless the caller explicitly asks for it.
+            start = self.INSIDE if (inside_now and not self.count_first_seen_inside) else self.OUTSIDE
+            lane = self.states[track_id] = {"state": start, "streak": 0}
+        return lane
+
+    def update(self, track_id, point, t_now):
+        """Feed one observation. Returns True exactly on a counted transition."""
+        if not self.active:
+            return False
+        inside = point_in_polygon(point, self.polygon)
+        lane = self._lane(track_id, inside)
+        state = lane["state"]
+
+        if inside:
+            if state in (self.OUTSIDE, self.ENTERING):
+                lane["streak"] = lane["streak"] + 1 if state == self.ENTERING else 1
+                lane["state"] = self.ENTERING
+                if lane["streak"] >= self.enter_frames:
+                    lane["state"] = self.INSIDE
+                    lane["streak"] = 0
+                    lane["entered_at"] = t_now
+                    return True
+            else:                                   # INSIDE / LEAVING -> still inside
+                lane["state"] = self.INSIDE
+                lane["streak"] = 0
+        else:
+            if state in (self.INSIDE, self.LEAVING):
+                lane["streak"] = lane["streak"] + 1 if state == self.LEAVING else 1
+                lane["state"] = self.LEAVING
+                if lane["streak"] >= self.exit_frames:
+                    lane["state"] = self.OUTSIDE
+                    lane["streak"] = 0
+            else:
+                lane["state"] = self.OUTSIDE
+                lane["streak"] = 0
+        return False
+
+    def drop(self, track_id):
+        self.states.pop(track_id, None)
+
+
+ROI_COUNT_MODES = ("transition", "independent")
+
+
+def roi_owner_key(ev):
+    """Who a ROI visit belongs to: the ReID identity, or the raw track."""
+    return ev.get("person_name") or f"track:{ev.get('local_track_id')}"
+
+
+def classify_roi_events(events, mode="transition", require_entry_before_exit=False):
+    """Decide which ROI visits count toward the ENTRY / EXIT totals.
+
+    `events` are debounced ROI ARRIVALS - "this person is now inside the entry
+    polygon" - one per ROIMonitor firing. Which of those arrivals is worth
+    counting is a separate question, answered here so the live pipeline and the
+    after-the-fact ROI replay can never drift apart.
+
+    transition (default)
+        Only a DIRECTIONAL crossing between the two regions counts: somebody
+        last seen in the Exit ROI who is now in the Entry ROI has entered, and
+        the reverse is an exit. This is what a doorway actually looks like -
+        the two polygons are the outside and the inside, and only movement
+        BETWEEN them means anything. Arriving in the Entry ROI from anywhere
+        else (off-camera, the middle of the room) is recorded but not counted.
+
+        The person may pass through un-covered floor on the way; only the last
+        region they were in matters. Requiring the polygons to touch would mean
+        almost nothing ever counted.
+
+    independent
+        Every arrival counts on its own - the older behaviour, kept because it
+        is the right rule when the two regions are unrelated areas rather than
+        two sides of a threshold. `require_entry_before_exit` additionally
+        drops exits by people who were never counted in.
+
+    Events are annotated in place and returned in time order. Each gains
+    `counted`; transition mode also records `from_roi`, the region the person
+    came from (None if they had not been in either).
+    """
+    ordered = sorted(events, key=lambda e: (float(e.get("time") or 0.0),
+                                            e.get("event") or ""))
+    if mode == "independent":
+        entered = set()
+        for ev in ordered:
+            owner = roi_owner_key(ev)
+            if ev.get("event") == "entry":
+                entered.add(owner)
+                ev["matched"] = True
+                ev["counted"] = True
+            else:
+                ev["matched"] = owner in entered
+                ev["counted"] = ev["matched"] or not require_entry_before_exit
+        return ordered
+
+    last_roi = {}                       # owner -> the region they were last in
+    for ev in ordered:
+        owner = roi_owner_key(ev)
+        kind = ev.get("event")
+        previous = last_roi.get(owner)
+        ev["from_roi"] = previous
+        # crossing over from the other region is the event; re-arriving in the
+        # same one (stepped out, stepped back) is not
+        ev["counted"] = previous is not None and previous != kind
+        ev["matched"] = ev["counted"]   # older readers only know this name
+        last_roi[owner] = kind
+    return ordered
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +756,31 @@ class IdentityGallery:
             name = self.aliases[name]
         return name
 
+    def live(self, tr):
+        """The identity this track currently belongs to, following merges.
+
+        A track keeps whatever name it was given, but that identity can later be
+        folded into another one by absorb(), which REMOVES it from `persons`.
+        Looking the old name up directly then raises KeyError and takes the
+        whole analysis down with it - which is what happened to a job that died
+        on KeyError: 'CoralBadger' after ~1 s. Several live tracks can point at
+        the same identity, and merge() only re-points the one that triggered it,
+        so the others are left holding a name that no longer exists.
+
+        Returns None only if the name is unknown entirely (it never existed, or
+        the gallery was rebuilt), which callers treat as "nothing to update".
+        """
+        name = getattr(tr, "person_name", None)
+        if name is None:
+            return None
+        resolved = self.resolve(name)
+        person = self.persons.get(resolved)
+        if person is None:
+            return None
+        if resolved != name:
+            tr.person_name = resolved      # keep the track honest from here on
+        return person
+
     def create(self, t_now):
         person = PersonState(self.names.next(), self._next_id, self.cfg, t_now)
         self._next_id += 1
@@ -556,6 +946,15 @@ class TrackState:
 # ---------------------------------------------------------------------------
 FONT = cv2.FONT_HERSHEY_DUPLEX
 
+# Same two hues the ROI editor and the result dashboard use, in BGR:
+# Entry = series-1 blue #3987e5, Exit = series-2 orange #d95926.
+ROI_COLORS = {"entry": (229, 135, 57), "exit": (38, 89, 217)}
+
+# Track history is written raw during analysis and canonicalised afterwards.
+TRACKS_RAW_NAME = "tracks.raw.jsonl"
+TRACKS_NAME = "tracks.jsonl.gz"
+COUNT_FLASH_SECONDS = 1.2
+
 
 HUD_HEIGHT = 34
 
@@ -613,17 +1012,59 @@ def _label_block(frame, box, lines, color, font_scale, top_limit=0, occupied=Non
         cy += 7
 
 
-def draw_overlay(frame, tracks, gallery, live_ids, t_now, cfg, frame_idx, fps):
+def draw_roi_polygons(frame, cfg):
+    """Outline the Entry / Exit floor regions the counting actually used."""
+    roi = cfg.get("roi") or {}
+    for kind in ("entry", "exit"):
+        polygon = roi.get(f"{kind}_polygon") or []
+        if len(polygon) < 3:
+            continue
+        pts = np.array([[int(p[0]), int(p[1])] for p in polygon], np.int32).reshape(-1, 1, 2)
+        color = ROI_COLORS[kind]
+        overlay = frame.copy()
+        cv2.fillPoly(overlay, [pts], color)
+        cv2.addWeighted(overlay, 0.18, frame, 0.82, 0, frame)
+        cv2.polylines(frame, [pts], True, color, 2, cv2.LINE_AA)
+        label = f"{kind.upper()} ROI"
+        ox, oy = int(polygon[0][0]) + 6, max(18, int(polygon[0][1]) - 8)
+        cv2.putText(frame, label, (ox, oy), FONT, 0.6, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(frame, label, (ox, oy), FONT, 0.6, color, 1, cv2.LINE_AA)
+
+
+def draw_count_bar(frame, entries, exits, t_now, frame_idx):
+    """The running ENTRY / EXIT tally, bottom-left, over a dark plate."""
+    h, w = frame.shape[:2]
+    pad, bar_h = 14, 54
+    y0 = h - bar_h - pad
+    x0 = pad
+    width = 330
+    region = frame[y0:y0 + bar_h, x0:x0 + min(width, w - 2 * pad)]
+    if region.size:
+        shade = np.full_like(region, 16)
+        cv2.addWeighted(shade, 0.94, region, 0.06, 0, region)
+    cv2.rectangle(frame, (x0, y0), (x0 + width, y0 + bar_h), (70, 70, 70), 1)
+    cv2.putText(frame, f"ENTRY {entries}", (x0 + 14, y0 + 36), FONT, 0.95,
+                ROI_COLORS["entry"], 2, cv2.LINE_AA)
+    cv2.putText(frame, f"EXIT {exits}", (x0 + 180, y0 + 36), FONT, 0.95,
+                ROI_COLORS["exit"], 2, cv2.LINE_AA)
+
+
+def draw_overlay(frame, tracks, gallery, live_ids, t_now, cfg, frame_idx, fps,
+                 counts=None, flashes=()):
     vis = cfg["visualization"]
     fs = float(vis.get("font_scale", 0.75))
     th = int(vis.get("thickness", 2))
+    band = float((cfg.get("person") or {}).get("ground_band_ratio", DEFAULT_GROUND_BAND_RATIO))
+
+    if vis.get("show_roi", True):
+        draw_roi_polygons(frame, cfg)
 
     top = 0
     if vis.get("show_hud", True):
         top = HUD_HEIGHT
-        n_active = sum(1 for p in gallery.persons.values() if p.active)
+        visible = sum(1 for t in live_ids if tracks[t].person_name is not None)
         hud = (f"frame {frame_idx}   t={t_now:6.2f}s   people seen: {len(gallery.persons)}"
-               f"   active: {n_active}   lost: {len(gallery.persons) - n_active}")
+               f"   on screen: {visible}")
         cv2.rectangle(frame, (0, 0), (frame.shape[1], HUD_HEIGHT), (20, 20, 20), -1)
         cv2.putText(frame, hud, (12, 23), FONT, 0.62, (240, 240, 240), 1, cv2.LINE_AA)
 
@@ -644,14 +1085,29 @@ def draw_overlay(frame, tracks, gallery, live_ids, t_now, cfg, frame_idx, fps):
                          (140, 140, 140), fs, top, occupied)
             continue
 
-        person = gallery.persons[tr.person_name]
+        person = gallery.live(tr)
+        if person is None:
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (140, 140, 140), 1)
+            continue
         color = person.color()
         banner = vis.get("show_reid_match", True) and t_now <= tr.banner_until
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, th + (1 if banner else 0))
 
+        # the bottom-band ground point - the single position the ROI test uses
+        if vis.get("show_ground_point", True):
+            gx, gy = person_ground_point(tr.box, band)
+            by1 = y1 + (y2 - y1) * (1.0 - band)
+            cv2.line(frame, (x1, int(by1)), (x2, int(by1)), color, 1, cv2.LINE_AA)
+            cv2.circle(frame, (int(gx), int(gy)), 5, (255, 255, 255), -1, cv2.LINE_AA)
+            cv2.circle(frame, (int(gx), int(gy)), 5, color, 2, cv2.LINE_AA)
+
         lines = []
         if vis.get("show_person_name", True):
             lines.append((person.name, 1.25, (255, 255, 255)))
+        flash = next((f for f in flashes if f[0] == person.name), None)
+        if flash is not None:
+            kind = flash[1]
+            lines.append((f"COUNTED: {kind.upper()}", 1.05, ROI_COLORS[kind]))
         if banner:
             lines.append(("RE-ID MATCH", 1.0, (0, 235, 255)))
             lines.append((f"Similarity: {tr.banner_similarity:.2f}", 0.85, (0, 235, 255)))
@@ -671,6 +1127,10 @@ def draw_overlay(frame, tracks, gallery, live_ids, t_now, cfg, frame_idx, fps):
             lines.append((f"local id {tr.id}", 0.75, (170, 170, 170)))
 
         _label_block(frame, (x1, y1, x2, y2), lines, color, fs, top, occupied)
+
+    # drawn last so no bounding box or label can cover the running tally
+    if counts is not None and vis.get("show_counts", True):
+        draw_count_bar(frame, counts[0], counts[1], t_now, frame_idx)
 
     return frame
 
@@ -806,6 +1266,67 @@ class Analyzer:
         self.match_counter = {}
         self.reject_counter = 0
         self.render_log = []
+
+        # The web server never wants an annotated video - only the numbers -
+        # so rendering is a switch rather than an assumption.
+        self.render_enabled = bool(cfg["video"].get("render", True))
+        # Called as progress(frame_index, total_frames) every progress_interval
+        # frames; the worker uses it to update the job row.
+        self.progress_cb = None
+        self.progress_interval = int(cfg["video"].get("progress_interval", 50))
+        self.cancelled = None            # optional callable -> stop early
+
+        # Entry / Exit floor ROIs (person analysis). Absent -> no ROI counting.
+        pcfg = cfg.get("person") or {}
+        self.ground_band_ratio = float(pcfg.get("ground_band_ratio", DEFAULT_GROUND_BAND_RATIO))
+        roi_cfg = cfg.get("roi") or {}
+        self.roi_monitors = []
+        for kind in ("entry", "exit"):
+            polygon = roi_cfg.get(f"{kind}_polygon") or []
+            if len(polygon) >= 3:
+                self.roi_monitors.append(ROIMonitor(
+                    kind, polygon,
+                    enter_frames=int(roi_cfg.get("enter_frames", 3)),
+                    exit_frames=int(roi_cfg.get("exit_frames", 5)),
+                    count_first_seen_inside=bool(roi_cfg.get("count_first_seen_inside", False)),
+                ))
+        self.roi_min_repeat_seconds = float(roi_cfg.get("min_repeat_seconds", 2.0))
+        # How a ROI arrival becomes a count - see classify_roi_events().
+        # "transition": only Exit->Entry counts as an entry and Entry->Exit as
+        # an exit. "independent": every arrival counts by itself.
+        self.roi_count_mode = str(roi_cfg.get("count_mode", "transition")).lower()
+        if self.roi_count_mode not in ROI_COUNT_MODES:
+            self.roi_count_mode = "transition"
+        # Only meaningful in "independent" mode: drop exits by people who were
+        # never counted in. In "transition" mode the ordering is inherent.
+        self.require_entry_before_exit = bool(
+            roi_cfg.get("require_entry_before_exit", False))
+        self.roi_events = []             # raw events, re-attributed in _finish
+        self._roi_last = {}              # (owner_key, kind) -> t of last counted event
+        self._roi_resolved = False
+
+        # Dwell heatmap over the SAME bottom-band ground point the ROIs use, so
+        # the picture and the counts can never disagree. One cell per person per
+        # frame, i.e. it accumulates time-spent, not head-count.
+        # ---- track-position history ------------------------------------
+        # Sampled on VIDEO time, so 25 / 29.97 / 30 / 59.94 fps all yield the
+        # same ~5 samples per second. This is storage only: the detector, the
+        # tracker, ReID and MiVOLO all keep their own cadence.
+        tcfg = cfg.get("tracks") or {}
+        self.tracks_enabled = bool(tcfg.get("enabled", True))
+        self.track_sample_fps = float(tcfg.get("sample_fps", 5.0)) or 5.0
+        self.track_interval = 1.0 / self.track_sample_fps
+        self.track_decimals = int(tcfg.get("bbox_decimals", 1))
+        self._track_slot = -1            # last emitted sample slot, drift-free
+        self._track_fh = None
+        self.track_samples = 0
+        self.tracks_raw_path = None
+        self.tracks_path = None
+
+        hm_cfg = pcfg.get("heatmap") or {}
+        self.heatmap_enabled = bool(hm_cfg.get("enabled", True))
+        self.heatmap_cols = max(8, int(hm_cfg.get("cols", 64)))
+        self.heatmap = None              # allocated in run(), once the size is known
 
     # -- events ------------------------------------------------------------
     def _event(self, t_now, kind, person=None, local_track_id=None, **extra):
@@ -995,6 +1516,206 @@ class Analyzer:
         tr.pending.clear()
         return person
 
+    # -- ground point: heatmap + Entry / Exit ROIs -------------------------
+    def _update_ground(self, live_ids, t_now, frame_idx, width, height):
+        """The ground point is computed ONCE per visible track per frame, and
+        both the dwell heatmap and the ROI state machines read that same value."""
+        for tid in live_ids:
+            tr = self.tracks[tid]
+            if tr.box is None:
+                continue
+            point = person_ground_point(tr.box, self.ground_band_ratio)
+            if self.heatmap is not None:
+                rows, cols = self.heatmap.shape
+                col = int(point[0] / max(width, 1) * cols)
+                row = int(point[1] / max(height, 1) * rows)
+                if 0 <= col < cols and 0 <= row < rows:
+                    self.heatmap[row, col] += 1.0
+            for monitor in self.roi_monitors:
+                if not monitor.update(tid, point, t_now):
+                    continue
+                # Prefer the persistent ReID identity: tracker ids change every
+                # time somebody is briefly occluded, the identity does not.
+                owner = (self.gallery.resolve(tr.person_name)
+                         if tr.person_name else f"track:{tid}")
+                key = (owner, monitor.kind)
+                last = self._roi_last.get(key)
+                if last is not None and t_now - last < self.roi_min_repeat_seconds:
+                    continue                      # same identity, same ROI, moments ago
+                self._roi_last[key] = t_now
+                self.roi_events.append({
+                    "time": round(float(t_now), 3),
+                    "frame": int(frame_idx),
+                    "event": monitor.kind,        # "entry" | "exit"
+                    "local_track_id": int(tid),
+                    "person_name": tr.person_name,
+                    "point": [round(point[0], 1), round(point[1], 1)],
+                })
+                self._event(t_now, f"roi_{monitor.kind}",
+                            self.gallery.persons.get(owner), tid,
+                            x=round(point[0], 1), y=round(point[1], 1))
+
+    # -- track history -----------------------------------------------------
+    def _open_tracks(self):
+        """Raw JSONL, appended as the video is decoded and never held in RAM."""
+        if not self.tracks_enabled:
+            return
+        out_dir = self.cfg["video"]["output_dir"]
+        tracks_dir = self.cfg.get("tracks", {}).get("dir") or out_dir
+        os.makedirs(tracks_dir, exist_ok=True)
+        self.tracks_raw_path = os.path.join(tracks_dir, TRACKS_RAW_NAME)
+        self.tracks_path = os.path.join(tracks_dir, TRACKS_NAME)
+        self._track_fh = open(self.tracks_raw_path, "w", encoding="utf-8",
+                              newline="\n")
+
+    def _sample_tracks(self, live_ids, t_now, frame_idx):
+        """Emit at most one line per 1/sample_fps slice of VIDEO time.
+
+        The slot index is computed from the timestamp rather than accumulated,
+        so a dropped or duplicated frame cannot make the sample times drift.
+        """
+        if self._track_fh is None:
+            return
+        slot = int(t_now / self.track_interval + 1e-9)
+        if slot <= self._track_slot:
+            return
+        self._track_slot = slot
+        people = []
+        for tid in live_ids:
+            tr = self.tracks.get(tid)
+            if tr is None or tr.box is None:
+                continue
+            people.append({
+                "person_name": tr.person_name,      # provisional; resolved later
+                "local_track_id": int(tid),
+                "bbox": [round(float(v), self.track_decimals) for v in tr.box[:4]],
+            })
+        if not people:
+            return
+        self._track_fh.write(json.dumps(
+            {"frame": int(frame_idx), "time": round(float(t_now), 3),
+             "people": people}, separators=(",", ":")) + "\n")
+        self.track_samples += 1
+
+    def finalize_tracks(self):
+        """Raw -> canonical identities -> gzip, streaming, then drop the raw file.
+
+        A track's name at sample time is provisional: it may have been null, or
+        a name ReID later folded into somebody else. The final gallery is the
+        only authority, so every line is rewritten against it here - the same
+        rule `_resolve_roi_events` applies to ROI events.
+        """
+        if self._track_fh is not None:
+            self._track_fh.close()
+            self._track_fh = None
+        if not self.tracks_raw_path or not os.path.exists(self.tracks_raw_path):
+            return None
+
+        by_track = {}
+        for person in self.gallery.persons.values():
+            for tid in person.local_track_ids:
+                by_track[int(tid)] = person.name
+
+        def canonical(entry):
+            name = entry.get("person_name")
+            name = self.gallery.resolve(name) if name else None
+            if name is None or name not in self.gallery.persons:
+                name = by_track.get(int(entry["local_track_id"]))
+            return name
+
+        t0 = time.perf_counter()
+        lines = 0
+        # line by line, in and out - a 10-hour video never lands in memory
+        with open(self.tracks_raw_path, "r", encoding="utf-8") as src, \
+                gzip.open(self.tracks_path, "wt", encoding="utf-8",
+                          compresslevel=6, newline="\n") as dst:
+            for raw in src:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                rec = json.loads(raw)
+                for entry in rec["people"]:
+                    entry["person_name"] = canonical(entry)
+                dst.write(json.dumps(rec, separators=(",", ":"),
+                                     ensure_ascii=False) + "\n")
+                lines += 1
+
+        os.remove(self.tracks_raw_path)
+        self.tracks_raw_path = None
+        print(f"[tracks] {lines} samples -> {self.tracks_path} "
+              f"({os.path.getsize(self.tracks_path) / 1e6:.1f} MB, "
+              f"{time.perf_counter() - t0:.1f}s)")
+        return {"file": TRACKS_NAME, "path": self.tracks_path,
+                "samples": lines, "sample_fps": self.track_sample_fps}
+
+    def counted_roi_events(self):
+        """The events that make up the headline counts.
+
+        Visits that do not count are kept in the record (flagged counted=False)
+        rather than dropped, so the summary, the JSON and the burnt-in video
+        counter are all derived from one list and cannot disagree.
+        """
+        self._resolve_roi_events()
+        return [e for e in self.roi_events if e.get("counted", True)]
+
+    def heatmap_json(self):
+        """The dwell grid as plain JSON: raw counts plus what they mean.
+
+        Raw counts, not normalised - the viewer decides how to scale them, and
+        two jobs stay comparable. `frames_per_unit` is 1, i.e. one unit is one
+        person visible in that cell for one frame.
+        """
+        if self.heatmap is None:
+            return None
+        grid = self.heatmap
+        rows, cols = grid.shape
+        return {
+            "cols": int(cols),
+            "rows": int(rows),
+            "max": float(grid.max()),
+            "total": float(grid.sum()),
+            "unit": "person-frames",
+            "cells": [[int(v) for v in row] for row in grid.astype(np.int64)],
+        }
+
+    def _resolve_roi_events(self):
+        """Attribute every ROI event to the identity the track ENDED UP as.
+
+        An event may have fired before the track was named, or under a name that
+        was later folded into somebody else; both are fixed here, and the
+        per-identity de-duplication is applied a second time on the final names.
+        """
+        if self._roi_resolved:
+            return self.roi_events
+        # final name per local track id, from the identities that survived
+        by_track = {}
+        for person in self.gallery.persons.values():
+            for tid in person.local_track_ids:
+                by_track[int(tid)] = person.name
+
+        resolved, seen = [], {}
+        for ev in sorted(self.roi_events, key=lambda e: e["time"]):
+            name = ev.get("person_name")
+            name = self.gallery.resolve(name) if name else None
+            if name is None or name not in self.gallery.persons:
+                name = by_track.get(int(ev["local_track_id"]))
+            owner = name or f"track:{ev['local_track_id']}"
+            key = (owner, ev["event"])
+            last = seen.get(key)
+            if last is not None and ev["time"] - last < self.roi_min_repeat_seconds:
+                continue
+            seen[key] = ev["time"]
+            out = dict(ev)
+            out["person_name"] = name
+            resolved.append(out)
+        # Counting comes last, on the FINAL names: a visit may have fired before
+        # its track had a name, or under one later merged away, so only now can
+        # we say which region this person was really in beforehand.
+        self.roi_events = classify_roi_events(
+            resolved, self.roi_count_mode, self.require_entry_before_exit)
+        self._roi_resolved = True
+        return self.roi_events
+
     def _frame_faces(self, frame, cache):
         """Face detection is run at most once per frame and shared by the face
         ReID signal and the age/gender model."""
@@ -1010,7 +1731,9 @@ class Analyzer:
             tr = self.tracks[tid]
             if tr.person_name is None or tr.quality < float(dc["min_quality"]):
                 continue
-            person = self.gallery.persons[tr.person_name]
+            person = self.gallery.live(tr)
+            if person is None:
+                continue
             if len(person.age_samples) >= int(dc["max_samples"]):
                 continue
             interval = int(dc["interval"])
@@ -1037,7 +1760,9 @@ class Analyzer:
             has_face.append(face is not None)
 
         for tr, sample, hf in zip(owners, self.demographics.predict(face_crops, body_crops), has_face):
-            person = self.gallery.persons[tr.person_name]
+            person = self.gallery.live(tr)
+            if person is None:
+                continue
             person.add_demographics(sample, tr.quality, hf)
             person.last_demo_frame = frame_idx
 
@@ -1059,8 +1784,9 @@ class Analyzer:
         for tr, emb in zip(owners, self.face_embedder.extract(crops)):
             if len(tr.faces) < cap:
                 tr.faces.append(emb)
-            if tr.person_name is not None:
-                self.gallery.persons[tr.person_name].store_face(emb, tr.quality, frame_idx)
+            owner = self.gallery.live(tr)
+            if owner is not None:
+                owner.store_face(emb, tr.quality, frame_idx)
 
     # -- pass 2: draw the video from the FINAL identities -------------------
     def _render_video(self, fps, width, height):
@@ -1072,16 +1798,28 @@ class Analyzer:
             raise RuntimeError(f"cannot open video writer for {out}")
 
         t0 = time.perf_counter()
-        by_frame = dict(self.render_log)
+        # cumulative ENTRY / EXIT at each frame, from the resolved events
+        events = sorted(self.counted_roi_events(), key=lambda e: int(e.get("frame", 0)))
+        flash_frames = max(1, int(fps * COUNT_FLASH_SECONDS))
         first = self.render_log[0][0] if self.render_log else 0
         if first:
             cap.set(cv2.CAP_PROP_POS_FRAMES, first)
 
         written = 0
+        cursor = 0
+        n_entry = n_exit = 0
         for frame_idx, entries in self.render_log:
             ok, frame = cap.read()
             if not ok:
                 break
+            while cursor < len(events) and int(events[cursor].get("frame", 0)) <= frame_idx:
+                if events[cursor]["event"] == "entry":
+                    n_entry += 1
+                else:
+                    n_exit += 1
+                cursor += 1
+            flashes = [(e.get("person_name"), e["event"]) for e in events
+                       if 0 <= frame_idx - int(e.get("frame", 0)) < flash_frames]
             live, tracks = [], {}
             for e in entries:
                 name = self.gallery.resolve(e["name"]) if e["name"] else None
@@ -1094,7 +1832,10 @@ class Analyzer:
                 shim.banner_similarity = e["sim"]
                 tracks[e["tid"]] = shim
                 live.append(e["tid"])
-            draw_overlay(frame, tracks, self.gallery, live, frame_idx / fps, cfg, frame_idx, fps)
+            draw_overlay(frame, tracks, self.gallery, live, frame_idx / fps, cfg,
+                         frame_idx, fps,
+                         counts=(n_entry, n_exit) if self.roi_monitors else None,
+                         flashes=flashes)
             writer.write(frame)
             written += 1
             if written % 200 == 0:
@@ -1126,22 +1867,37 @@ class Analyzer:
         # the discarded name burnt into every frame already written. Pass 2
         # redraws from the FINAL identities, so what you watch matches the JSON.
         self.two_pass = bool(vcfg.get("two_pass", True))
+        if not self.render_enabled:
+            self.two_pass = False        # nothing to render in either pass
         writer = None
-        if not self.two_pass:
+        if self.render_enabled and not self.two_pass:
             writer = cv2.VideoWriter(vcfg["output"], cv2.VideoWriter_fourcc(*"mp4v"),
                                      fps, (width, height))
             if not writer.isOpened():
                 raise RuntimeError(f"cannot open video writer for {vcfg['output']}")
 
         print(f"[video] {vcfg['input']}  {width}x{height} @ {fps:.2f}fps  {total} frames")
-        print(f"[video] {'two-pass render' if self.two_pass else 'streaming render'} "
-              f"-> {vcfg['output']}")
+        if self.render_enabled:
+            print(f"[video] {'two-pass render' if self.two_pass else 'streaming render'} "
+                  f"-> {vcfg['output']}")
+        else:
+            print("[video] structured output only - no result video is written")
 
         rc = cfg["reid"]
         reassess_n = int(rc.get("reassess_embeddings", 8))
         max_age = int(cfg["tracking"]["max_age_frames"])
+        self._open_tracks()
+
+        if self.heatmap_enabled:
+            cols = self.heatmap_cols
+            rows = max(8, int(round(cols * height / max(width, 1))))
+            self.heatmap = np.zeros((rows, cols), np.float32)
+
         frame_idx = start_frame
         processed = 0
+        total_wanted = max(0, total - start_frame)
+        if max_frames:
+            total_wanted = min(total_wanted, max_frames) if total_wanted else max_frames
         wall0 = time.perf_counter()
 
         while True:
@@ -1169,8 +1925,17 @@ class Analyzer:
                 others = [b for b in boxes if b is not det["xyxy"]]
                 tr.quality = crop_quality(frame, tr.box, tr.conf, others)
                 live_ids.append(tid)
-                if tr.person_name is not None:
-                    self.gallery.persons[tr.person_name].touch(t_now, tr.box)
+                owner = self.gallery.live(tr)
+                if owner is not None:
+                    owner.touch(t_now, tr.box)
+
+            # 1b) everything that reads the bottom-band ground point: the dwell
+            #     heatmap and the Entry / Exit ROI transitions
+            if self.heatmap is not None or self.roi_monitors:
+                self._update_ground(live_ids, t_now, frame_idx, width, height)
+
+            # 1c) track-position history, sampled on video time
+            self._sample_tracks(live_ids, t_now, frame_idx)
 
             # 2) which tracks want a ReID feature this frame?
             need = []
@@ -1198,9 +1963,9 @@ class Analyzer:
                             if len(tr.pending) >= int(rc["min_embeddings_to_assign"]):
                                 self._assign_identity(tr, frame, t_now, live_ids, frame_diag)
                         else:
-                            self.gallery.persons[tr.person_name].store_embedding(
-                                emb, tr.quality, frame_idx, crop
-                            )
+                            owner = self.gallery.live(tr)
+                            if owner is not None:
+                                owner.store_embedding(emb, tr.quality, frame_idx, crop)
                             if len(tr.history) < reassess_n:
                                 tr.history.append((emb, tr.quality))
                             if not tr.reassessed and len(tr.history) >= reassess_n:
@@ -1219,17 +1984,21 @@ class Analyzer:
                 self._event(gone_at, "track_end", None, tid,
                             person_name=tr.person_name,
                             frames=tr.last_frame - tr.first_frame + 1)
-                if tr.person_name is not None:
-                    person = self.gallery.persons[tr.person_name]
+                person = self.gallery.live(tr)
+                if person is not None:
                     if person.current_local_track_id == tid:
                         person.unbind()
                         self._event(gone_at, "lost", person, tid,
                                     visible_seconds=round(person.segments[-1]["end"]
                                                           - person.segments[-1]["start"], 2))
+                for monitor in self.roi_monitors:
+                    monitor.drop(tid)
                 del self.tracks[tid]
 
             # 5) render now, or remember what to render in pass 2
-            if self.two_pass:
+            if not self.render_enabled:
+                pass
+            elif self.two_pass:
                 self.render_log.append((frame_idx, [
                     {"tid": t,
                      "box": [float(v) for v in self.tracks[t].box],
@@ -1260,14 +2029,21 @@ class Analyzer:
 
             frame_idx += 1
             processed += 1
-            if processed % 50 == 0:
+            if processed % self.progress_interval == 0:
                 elapsed = time.perf_counter() - wall0
                 print(f"  ... {processed} frames  ({processed / elapsed:.1f} fps)  "
                       f"people={len(self.gallery.persons)}")
+                if self.progress_cb is not None:
+                    self.progress_cb(frame_idx - start_frame, total_wanted)
+                if self.cancelled is not None and self.cancelled():
+                    print("[run] cancellation requested - stopping early")
+                    break
 
         cap.release()
         if writer is not None:
             writer.release()
+        if self._track_fh is not None:
+            self._track_fh.flush()
 
         # close whatever is still open at the end of the video
         end_t = (frame_idx - 1) / fps
@@ -1280,7 +2056,14 @@ class Analyzer:
                 self._event(end_t, "track_end", person, tr.id, reason="video_end")
 
         analysis_wall = time.perf_counter() - wall0
-        if self.two_pass:
+        # Resolve first: the counters burnt into the video must be the SAME
+        # numbers the JSON reports, not the raw pre-dedup events.
+        if self.roi_monitors:
+            self._resolve_roi_events()
+        # Canonicalise the track history against the FINAL gallery. Must happen
+        # after the loop, because that is when identities stop changing.
+        self.track_storage = self.finalize_tracks()
+        if self.render_enabled and self.two_pass:
             self._render_video(fps, width, height)
         wall = time.perf_counter() - wall0
         return self._finish(processed, wall, fps, analysis_wall)
@@ -1290,6 +2073,9 @@ class Analyzer:
         cfg = self.cfg
         out_dir = cfg["video"]["output_dir"]
         persons = sorted(self.gallery.persons.values(), key=lambda p: p.first_seen)
+        roi_events = self._resolve_roi_events() if self.roi_monitors else []
+        video_path = cfg["video"]["output"] if self.render_enabled else None
+        heatmap = self.heatmap_json()
 
         persons_path = os.path.join(out_dir, "persons.json")
         with open(persons_path, "w", encoding="utf-8") as fh:
@@ -1349,11 +2135,26 @@ class Analyzer:
                   f"age={'--' if age is None else f'{age:.1f}'} gender={gender} "
                   f"(emb={p.embeddings.shape[0]}, demo_samples={len(p.age_samples)})")
         print("=" * 74)
-        print(f"  {cfg['video']['output']}\n  {persons_path}\n  {events_path}")
+        if self.render_enabled:
+            print(f"  {cfg['video']['output']}")
+        print(f"  {persons_path}\n  {events_path}")
+
+        if roi_events:
+            with open(os.path.join(out_dir, "roi_events.json"), "w", encoding="utf-8") as fh:
+                json.dump(roi_events, fh, indent=2)
+            entries = sum(1 for e in roi_events if e["event"] == "entry")
+            exits = sum(1 for e in roi_events if e["event"] == "exit")
+            print(f"  ROI entries / exits      : {entries} / {exits}")
 
         return {
             "persons": [p.to_json() for p in persons],
             "events": self.events,
+            "roi_events": roi_events,
+            "heatmap": heatmap,
+            "track_storage": getattr(self, "track_storage", None),
+            "result_video": video_path,
+            "fps": round(fps, 3),
+            "frames_processed": processed,
             "performance": {
                 "input_fps": round(fps, 3),
                 "analysis_seconds": None if analysis_wall is None else round(analysis_wall, 3),

@@ -1,0 +1,20 @@
+# Web video-analysis server.
+#
+# This file is ON TOP of the project-root requirements.txt - the AI stack
+# (torch, ultralytics, mivolo, onnxruntime-gpu, ...) is installed from there and
+# is NOT duplicated here. Install order:
+#
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#   pip install -r ../requirements.txt
+#   pip install wheel
+#   pip install --no-deps --no-build-isolation git+https://github.com/WildChlamydia/MiVOLO.git
+#   pip install -r requirements.txt
+
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+PyYAML>=6.0
+
+# ffprobe is used for extra container/codec detail when it is on PATH, but it is
+# optional: OpenCV (already required by the analysis pipelines) is what actually
+# gates upload validation, because it is what the analysis decodes with.
